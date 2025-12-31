@@ -19,7 +19,7 @@ node_modules/
 /dist/
 /build/
 *.log
-
+.github
 # 临时文件
 tmp/
 temp/
