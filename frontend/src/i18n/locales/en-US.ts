@@ -1229,7 +1229,7 @@ export default {
       overlapDescription: 'Number of overlapping characters between adjacent chunks (0-500)',
       separatorsLabel: 'Separators',
       separatorsDescription: 'Separators used when chunking documents',
-      separatorsPlaceholder: 'Select separators',
+      separatorsPlaceholder: 'Select or customize separators',
       separators: {
         doubleNewline: 'Double newline (\
 \
@@ -1270,7 +1270,13 @@ export default {
         minio: {
           bucketLabel: 'Bucket Name',
           bucketDescription: 'Name of the MinIO bucket (required)',
-          bucketPlaceholder: 'Enter bucket name (required)',
+          bucketPlaceholder: 'Select or enter bucket name',
+          bucketHint: 'Select an existing bucket with public read access, or enter a new name to create automatically',
+          policyLabels: {
+            public: 'Public Read',
+            private: 'Private',
+            custom: 'Custom'
+          },
           useSslLabel: 'Use SSL',
           useSslDescription: 'Whether to use SSL connection',
           pathPrefixLabel: 'Path Prefix',
