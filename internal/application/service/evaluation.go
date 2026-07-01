@@ -12,7 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	"github.com/google/uuid"
+	"github.com/Tencent/WeKnora/internal/utils"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -109,7 +109,7 @@ func (e *EvaluationService) EvaluationResult(ctx context.Context, taskID string)
 		return nil, err
 	}
 
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(
 		ctx,
 		"Checking tenant ID match, task tenant ID: %d, current tenant ID: %d",
@@ -138,7 +138,7 @@ func (e *EvaluationService) Evaluation(ctx context.Context,
 		datasetID, knowledgeBaseID, chatModelID, rerankModelID)
 
 	// Get tenant ID from context for multi-tenancy support
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Tenant ID: %d", tenantID)
 
 	// Handle knowledge base creation if not provided
@@ -253,7 +253,7 @@ func (e *EvaluationService) Evaluation(ctx context.Context,
 
 	// Create evaluation task with unique ID
 	logger.Info(ctx, "Creating evaluation task")
-	taskID := uuid.New().String()
+	taskID := utils.GenerateTaskID("evaluation", tenantID, datasetID)
 	logger.Infof(ctx, "Generated task ID: %s", taskID)
 
 	// Prepare evaluation detail with all parameters
@@ -266,31 +266,33 @@ func (e *EvaluationService) Evaluation(ctx context.Context,
 			StartTime: time.Now(),
 		},
 		Params: &types.ChatManage{
-			VectorThreshold:  e.config.Conversation.VectorThreshold,
-			KeywordThreshold: e.config.Conversation.KeywordThreshold,
-			EmbeddingTopK:    e.config.Conversation.EmbeddingTopK,
-			MaxRounds:        e.config.Conversation.MaxRounds,
-			RerankModelID:    rerankModelID,
-			RerankTopK:       e.config.Conversation.RerankTopK,
-			RerankThreshold:  e.config.Conversation.RerankThreshold,
-			ChatModelID:      chatModelID,
-			SummaryConfig: types.SummaryConfig{
-				MaxTokens:           e.config.Conversation.Summary.MaxTokens,
-				RepeatPenalty:       e.config.Conversation.Summary.RepeatPenalty,
-				TopK:                e.config.Conversation.Summary.TopK,
-				TopP:                e.config.Conversation.Summary.TopP,
-				Prompt:              e.config.Conversation.Summary.Prompt,
-				ContextTemplate:     e.config.Conversation.Summary.ContextTemplate,
-				FrequencyPenalty:    e.config.Conversation.Summary.FrequencyPenalty,
-				PresencePenalty:     e.config.Conversation.Summary.PresencePenalty,
-				NoMatchPrefix:       e.config.Conversation.Summary.NoMatchPrefix,
-				Temperature:         e.config.Conversation.Summary.Temperature,
-				Seed:                e.config.Conversation.Summary.Seed,
-				MaxCompletionTokens: e.config.Conversation.Summary.MaxCompletionTokens,
+			PipelineRequest: types.PipelineRequest{
+				VectorThreshold:  e.config.Conversation.VectorThreshold,
+				KeywordThreshold: e.config.Conversation.KeywordThreshold,
+				EmbeddingTopK:    e.config.Conversation.EmbeddingTopK,
+				MaxRounds:        e.config.Conversation.MaxRounds,
+				RerankModelID:    rerankModelID,
+				RerankTopK:       e.config.Conversation.RerankTopK,
+				RerankThreshold:  e.config.Conversation.RerankThreshold,
+				ChatModelID:      chatModelID,
+				SummaryConfig: types.SummaryConfig{
+					MaxTokens:           e.config.Conversation.Summary.MaxTokens,
+					RepeatPenalty:       e.config.Conversation.Summary.RepeatPenalty,
+					TopK:                e.config.Conversation.Summary.TopK,
+					TopP:                e.config.Conversation.Summary.TopP,
+					Prompt:              e.config.Conversation.Summary.Prompt,
+					ContextTemplate:     e.config.Conversation.Summary.ContextTemplate,
+					FrequencyPenalty:    e.config.Conversation.Summary.FrequencyPenalty,
+					PresencePenalty:     e.config.Conversation.Summary.PresencePenalty,
+					NoMatchPrefix:       e.config.Conversation.Summary.NoMatchPrefix,
+					Temperature:         e.config.Conversation.Summary.Temperature,
+					Seed:                e.config.Conversation.Summary.Seed,
+					MaxCompletionTokens: e.config.Conversation.Summary.MaxCompletionTokens,
+				},
+				FallbackResponse:    e.config.Conversation.FallbackResponse,
+				RewritePromptSystem: e.config.Conversation.RewritePromptSystem,
+				RewritePromptUser:   e.config.Conversation.RewritePromptUser,
 			},
-			FallbackResponse:    e.config.Conversation.FallbackResponse,
-			RewritePromptSystem: e.config.Conversation.RewritePromptSystem,
-			RewritePromptUser:   e.config.Conversation.RewritePromptUser,
 		},
 	}
 
@@ -351,7 +353,7 @@ func (e *EvaluationService) EvalDataset(ctx context.Context, detail *types.Evalu
 	logger.Infof(ctx, "Creating knowledge from %d passages", len(passages))
 
 	// Create knowledge base from passages
-	knowledge, err := e.knowledgeService.CreateKnowledgeFromPassage(ctx, knowledgeBaseID, passages)
+	knowledge, err := e.knowledgeService.CreateKnowledgeFromPassage(ctx, knowledgeBaseID, passages, "")
 	if err != nil {
 		logger.Errorf(ctx, "Failed to create knowledge from passages: %v", err)
 		return err

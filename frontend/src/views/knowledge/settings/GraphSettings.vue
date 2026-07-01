@@ -1,10 +1,9 @@
 <template>
-  <div class="graph-settings">
-    <div class="section-header">
+  <div class="graph-settings" :class="{ 'graph-settings--embedded': embedded }">
+    <div v-if="!embedded" class="section-header">
       <h2>{{ t('graphSettings.title') }}</h2>
       <p class="section-description">{{ t('graphSettings.description') }}</p>
-      
-      <!-- Warning message when graph database is not enabled -->
+
       <t-alert
         v-if="!isGraphDatabaseEnabled"
         theme="warning"
@@ -18,6 +17,15 @@
         </template>
       </t-alert>
     </div>
+    <t-alert
+      v-else-if="!isGraphDatabaseEnabled"
+      theme="warning"
+      class="embedded-graph-alert"
+    >
+      <template #message>
+        <div>{{ t('graphSettings.disabledWarning') }}</div>
+      </template>
+    </t-alert>
 
     <div v-if="isGraphDatabaseEnabled" class="settings-group">
       <!-- 启用实体关系提取 -->
@@ -43,6 +51,7 @@
         <div class="setting-control full-width">
           <div class="tags-control-group">
             <t-button
+              v-if="canRunGraphExtract"
               theme="default"
               size="medium"
               :disabled="!modelStatus.llm.available"
@@ -79,6 +88,7 @@
         <div class="setting-control full-width">
           <div class="text-control-group">
             <t-button
+              v-if="canRunGraphExtract"
               theme="default"
               size="medium"
               :disabled="!modelStatus.llm.available"
@@ -266,6 +276,7 @@
         <div class="setting-control">
           <div class="action-buttons">
             <t-button
+              v-if="canRunGraphExtract"
               theme="primary"
               :disabled="!modelStatus.llm.available || !localGraphExtract.text"
               :loading="extracting"
@@ -293,14 +304,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, computed } from 'vue'
+import { ref, watch, onMounted, computed, withDefaults } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
-import { extractTextRelations, fabriText, fabriTag, type Node, type Relation, type LLMConfig } from '@/api/initialization'
-import { listModels } from '@/api/model'
-import { getSystemInfo } from '@/api/system'
+import { extractTextRelations, fabriText, fabriTag, type Node, type Relation } from '@/api/initialization'
+import { useEditorResourcesStore } from '@/stores/editorResources'
+import { useAuthStore } from '@/stores/auth'
 
 const { t } = useI18n()
+const authStore = useAuthStore()
+
+// canRunGraphExtract 对应后端 POST /initialization/extract/{fabri-tag,fabri-text,
+// text-relation} 的 g.Admin() 守卫——这三个都是会调用大模型 + 写库的 admin
+// 工具。Contributor 看到按钮点了只会撞 403。
+const canRunGraphExtract = computed(() => authStore.hasRole('admin'))
 
 interface GraphExtractConfig {
   enabled: boolean
@@ -312,14 +329,24 @@ interface GraphExtractConfig {
 
 interface Props {
   graphExtract: GraphExtractConfig
+  modelId: string
   allModels?: any[]
+  embedded?: boolean
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  embedded: false,
+})
 
 const emit = defineEmits<{
   'update:graphExtract': [value: GraphExtractConfig]
 }>()
+
+const modelStatus = computed(() => ({
+  llm: {
+    available: !!props.modelId
+  }
+}))
 
 // 本地状态
 const localGraphExtract = ref<GraphExtractConfig>({
@@ -333,20 +360,12 @@ const tagFabring = ref(false)
 const textFabring = ref(false)
 const extracting = ref(false)
 
-// 模型状态
-const modelStatus = ref({
-  llm: {
-    available: false,
-    config: null as LLMConfig | null
-  }
-})
-
 // 系统信息
 const systemInfo = ref<any>(null)
 
 // 计算图数据库是否启用
 const isGraphDatabaseEnabled = computed(() => {
-  return systemInfo.value?.graph_database_engine && systemInfo.value.graph_database_engine !== '未启用'
+  return systemInfo.value?.graph_database_engine && systemInfo.value.graph_database_engine !== 'Not Enabled'
 })
 
 // Watch for prop changes
@@ -438,16 +457,9 @@ const removeRelation = (index: number) => {
 
 // 生成随机标签
 const handleFabriTag = async () => {
-  if (!modelStatus.value.llm.available || !modelStatus.value.llm.config) {
-    MessagePlugin.warning(t('graphSettings.completeModelConfig'))
-    return
-  }
-  
   tagFabring.value = true
   try {
-    const response = await fabriTag({
-      llm_config: modelStatus.value.llm.config
-    })
+    const response = await fabriTag({})
     localGraphExtract.value.tags = response.tags || []
     handleTagsChange()
     MessagePlugin.success(t('graphSettings.tagsGenerated'))
@@ -461,7 +473,7 @@ const handleFabriTag = async () => {
 
 // 生成随机文本
 const handleFabriText = async () => {
-  if (!modelStatus.value.llm.available || !modelStatus.value.llm.config) {
+  if (!props.modelId) {
     MessagePlugin.warning(t('graphSettings.completeModelConfig'))
     return
   }
@@ -470,7 +482,7 @@ const handleFabriText = async () => {
   try {
     const response = await fabriText({
       tags: localGraphExtract.value.tags,
-      llm_config: modelStatus.value.llm.config
+      model_id: props.modelId
     })
     localGraphExtract.value.text = response.text || ''
     handleTextChange()
@@ -485,7 +497,7 @@ const handleFabriText = async () => {
 
 // 提取实体关系
 const handleExtract = async () => {
-  if (!modelStatus.value.llm.available || !modelStatus.value.llm.config) {
+  if (!props.modelId) {
     MessagePlugin.warning(t('graphSettings.completeModelConfig'))
     return
   }
@@ -500,7 +512,7 @@ const handleExtract = async () => {
     const response = await extractTextRelations({
       text: localGraphExtract.value.text,
       tags: localGraphExtract.value.tags,
-      llm_config: modelStatus.value.llm.config
+      model_id: props.modelId
     })
     localGraphExtract.value.nodes = response.nodes || []
     localGraphExtract.value.relations = response.relations || []
@@ -516,18 +528,18 @@ const handleExtract = async () => {
 
 // 默认示例
 const defaultExtractExample = () => {
-  localGraphExtract.value.text = `《红楼梦》，又名《石头记》，是清代作家曹雪芹创作的中国古典四大名著之一，被誉为中国封建社会的百科全书。该书前80回由曹雪芹所著，后40回一般认为是高鹗所续。小说以贾、史、王、薛四大家族的兴衰为背景，以贾宝玉、林黛玉和薛宝钗的爱情悲剧为主线，刻画了以贾宝玉和金陵十二钗为中心的正邪两赋、贤愚并出的高度复杂的人物群像。成书于乾隆年间（1743年前后），是中国文学史上现实主义的高峰，对后世影响深远。`
-  localGraphExtract.value.tags = ['作者', '别名']
+  localGraphExtract.value.text = `"Romeo and Juliet" is a tragedy written by William Shakespeare early in his career, and is one of the most frequently performed plays in world literature. The play follows two young lovers from feuding families in Verona, Italy — the Montagues and the Capulets. Written around 1594-1596, it was first published in quarto in 1597. The full title is "The Most Excellent and Lamentable Tragedy of Romeo and Juliet." The story has been adapted countless times for stage, film, and other media.`
+  localGraphExtract.value.tags = ['Author', 'Alias']
   localGraphExtract.value.nodes = [
-    {name: '红楼梦', attributes: ['中国古典四大名著之一', '又名《石头记》', '被誉为中国封建社会的百科全书']},
-    {name: '石头记', attributes: ['《红楼梦》的别名']},
-    {name: '曹雪芹', attributes: ['清代作家', '《红楼梦》前 80 回的作者']},
-    {name: '高鹗', attributes: ['一般认为是《红楼梦》后 40 回的续写者']}
+    {name: 'Romeo and Juliet', attributes: ['One of the most frequently performed plays', 'Written around 1594-1596', 'A tragedy']},
+    {name: 'The Most Excellent and Lamentable Tragedy of Romeo and Juliet', attributes: ['Full title of Romeo and Juliet']},
+    {name: 'William Shakespeare', attributes: ['English playwright', 'Author of Romeo and Juliet']},
+    {name: 'Verona', attributes: ['City in Italy', 'Setting of the play']}
   ]
   localGraphExtract.value.relations = [
-    {node1: '红楼梦', node2: '石头记', type: '别名'},
-    {node1: '红楼梦', node2: '曹雪芹', type: '作者'},
-    {node1: '红楼梦', node2: '高鹗', type: '作者'}
+    {node1: 'Romeo and Juliet', node2: 'The Most Excellent and Lamentable Tragedy of Romeo and Juliet', type: 'Alias'},
+    {node1: 'Romeo and Juliet', node2: 'William Shakespeare', type: 'Author'},
+    {node1: 'Romeo and Juliet', node2: 'Verona', type: 'Setting'}
   ]
   handleNodesChange()
   MessagePlugin.success(t('graphSettings.exampleLoaded'))
@@ -543,33 +555,13 @@ const clearExtractExample = () => {
   MessagePlugin.success(t('graphSettings.exampleCleared'))
 }
 
-// 加载模型状态
-const loadModelStatus = async () => {
-  try {
-    const models = await listModels()
-    
-    // 查找可用的KnowledgeQA模型（对话模型）
-    const llmModels = models.filter((m: any) => m.type === 'KnowledgeQA')
-    if (llmModels.length > 0) {
-      const llmModel = llmModels[0]
-      modelStatus.value.llm.available = true
-      modelStatus.value.llm.config = {
-        source: llmModel.source,
-        model_name: llmModel.name,
-        base_url: llmModel.parameters?.base_url || '',
-        api_key: llmModel.parameters?.api_key || ''
-      }
-    }
-  } catch (error: any) {
-    console.error('Failed to load model status:', error)
-  }
-}
+const editorResources = useEditorResourcesStore()
 
 // 加载系统信息
-const loadSystemInfo = async () => {
+const loadSystemInfo = async (force = false) => {
   try {
-    const response = await getSystemInfo()
-    systemInfo.value = response.data
+    await editorResources.ensureSystemInfo(force)
+    systemInfo.value = editorResources.systemInfo
   } catch (error: any) {
     console.error('Failed to load system info:', error)
   }
@@ -586,10 +578,7 @@ const handleOpenGraphGuide = () => {
 
 // 初始化
 onMounted(async () => {
-  await Promise.all([
-    loadModelStatus(),
-    loadSystemInfo()
-  ])
+  await loadSystemInfo()
 })
 </script>
 
@@ -599,18 +588,18 @@ onMounted(async () => {
 }
 
 .section-header {
-  margin-bottom: 32px;
+  margin-bottom: 20px;
 
   h2 {
     font-size: 20px;
     font-weight: 600;
-    color: #333333;
-    margin: 0 0 8px 0;
+    color: var(--td-text-color-primary);
+    margin: 0 0 6px 0;
   }
 
   .section-description {
     font-size: 14px;
-    color: #666666;
+    color: var(--td-text-color-secondary);
     margin: 0;
     line-height: 1.5;
   }
@@ -626,8 +615,8 @@ onMounted(async () => {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  padding: 20px 0;
-  border-bottom: 1px solid #e5e7eb;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--td-component-stroke);
 
   &:last-child {
     border-bottom: none;
@@ -645,29 +634,29 @@ onMounted(async () => {
 }
 
 .setting-info {
-  flex: 1;
-  max-width: 65%;
+  flex: 0 0 40%;
+  max-width: 40%;
   padding-right: 24px;
 
   label {
     font-size: 15px;
     font-weight: 500;
-    color: #333333;
+    color: var(--td-text-color-primary);
     display: block;
     margin-bottom: 4px;
   }
 
   .desc {
     font-size: 13px;
-    color: #666666;
+    color: var(--td-text-color-secondary);
     margin: 0;
     line-height: 1.5;
   }
 }
 
 .setting-control {
-  flex-shrink: 0;
-  min-width: 280px;
+  flex: 0 0 55%;
+  max-width: 55%;
   display: flex;
   justify-content: flex-end;
   align-items: center;
@@ -698,10 +687,10 @@ onMounted(async () => {
   align-items: center;
   gap: 6px;
   font-size: 13px;
-  color: #666666;
+  color: var(--td-text-color-secondary);
 
   .tip-icon {
-    color: #0052d9;
+    color: var(--td-brand-color);
   }
 }
 
@@ -713,8 +702,8 @@ onMounted(async () => {
 }
 
 .node-item {
-  background: #f8fafb;
-  border: 1px solid #e5e7eb;
+  background: var(--td-bg-color-container);
+  border: 1px solid var(--td-component-stroke);
   border-radius: 8px;
   padding: 16px;
 }
@@ -727,7 +716,7 @@ onMounted(async () => {
 
   .node-icon {
     font-size: 20px;
-    color: #0052d9;
+    color: var(--td-brand-color);
   }
 
   .node-name-input {
@@ -768,8 +757,8 @@ onMounted(async () => {
   align-items: center;
   gap: 12px;
   padding: 12px;
-  background: #f8fafb;
-  border: 1px solid #e5e7eb;
+  background: var(--td-bg-color-container);
+  border: 1px solid var(--td-component-stroke);
   border-radius: 8px;
 
   .relation-select {
@@ -778,7 +767,7 @@ onMounted(async () => {
   }
 
   .relation-arrow {
-    color: #666666;
+    color: var(--td-text-color-secondary);
     font-size: 16px;
   }
 }
@@ -787,5 +776,28 @@ onMounted(async () => {
   display: flex;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.graph-settings--embedded {
+  .embedded-graph-alert {
+    margin-bottom: 12px;
+  }
+
+  .setting-row:not(.vertical) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 12px 0;
+  }
+
+  .setting-row:not(.vertical) .setting-info {
+    flex: none;
+    max-width: none;
+    padding-right: 0;
+  }
+
+  .setting-row:not(.vertical) .setting-control {
+    align-self: flex-start;
+  }
 }
 </style>

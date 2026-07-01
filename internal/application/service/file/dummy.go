@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 )
@@ -13,6 +14,11 @@ import (
 // DummyFileService is a no-op implementation of the FileService interface
 // used for testing or when file storage is not required
 type DummyFileService struct{}
+
+// CheckConnectivity always succeeds for the dummy service.
+func (s *DummyFileService) CheckConnectivity(ctx context.Context) error {
+	return nil
+}
 
 // NewDummyFileService creates a new instance of DummyFileService
 func NewDummyFileService() interfaces.FileService {
@@ -35,4 +41,21 @@ func (s *DummyFileService) GetFile(ctx context.Context, filePath string) (io.Rea
 // DeleteFile is a no-op operation that always succeeds
 func (s *DummyFileService) DeleteFile(ctx context.Context, filePath string) error {
 	return nil
+}
+
+// SaveBytes pretends to save bytes but just returns a random UUID
+func (s *DummyFileService) SaveBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	return uuid.New().String(), nil
+}
+
+// CopyFile is a no-op for the dummy service: it logs a warning and returns the
+// source path unchanged (the shared reference is intentional in this stub).
+func (s *DummyFileService) CopyFile(ctx context.Context, srcPath string, tenantID uint64, knowledgeID string) (string, error) {
+	logger.Warnf(ctx, "[dummy] CopyFile no-op: returning source path %q unchanged (no real copy performed)", srcPath)
+	return srcPath, nil
+}
+
+// GetFileURL returns the file path as URL (dummy implementation)
+func (s *DummyFileService) GetFileURL(ctx context.Context, filePath string) (string, error) {
+	return filePath, nil
 }

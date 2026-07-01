@@ -12,6 +12,11 @@ import (
 	"github.com/Tencent/WeKnora/internal/utils"
 )
 
+type graphConfigSummary struct {
+	Nodes     []string
+	Relations []string
+}
+
 var queryKnowledgeGraphTool = BaseTool{
 	name: ToolQueryKnowledgeGraph,
 	description: `Query knowledge graph to explore entity relationships and knowledge networks.
@@ -57,7 +62,7 @@ If KB is not configured with graph, tool will return regular search results.
 // QueryKnowledgeGraphInput defines the input parameters for query knowledge graph tool
 type QueryKnowledgeGraphInput struct {
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids" jsonschema:"Array of knowledge base IDs to query"`
-	Query            string   `json:"query" jsonschema:"查询内容（实体名称或查询文本）"`
+	Query            string   `json:"query" jsonschema:"Query content (entity name or query text)"`
 }
 
 // QueryKnowledgeGraphTool queries the knowledge graph for entities and relationships
@@ -135,7 +140,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			kb, err := t.knowledgeService.GetKnowledgeBaseByID(ctx, id)
 			if err != nil {
 				mu.Lock()
-				kbResults[id] = &graphQueryResult{kbID: id, err: fmt.Errorf("获取知识库失败: %v", err)}
+				kbResults[id] = &graphQueryResult{kbID: id, err: fmt.Errorf("failed to get knowledge base: %v", err)}
 				mu.Unlock()
 				return
 			}
@@ -143,7 +148,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			// Check if graph extraction is enabled
 			if kb.ExtractConfig == nil || (len(kb.ExtractConfig.Nodes) == 0 && len(kb.ExtractConfig.Relations) == 0) {
 				mu.Lock()
-				kbResults[id] = &graphQueryResult{kbID: id, err: fmt.Errorf("未配置知识图谱抽取")}
+				kbResults[id] = &graphQueryResult{kbID: id, err: fmt.Errorf("graph extraction not configured")}
 				mu.Unlock()
 				return
 			}
@@ -152,7 +157,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			results, err := t.knowledgeService.HybridSearch(ctx, id, searchParams)
 			if err != nil {
 				mu.Lock()
-				kbResults[id] = &graphQueryResult{kbID: id, kb: kb, err: fmt.Errorf("查询失败: %v", err)}
+				kbResults[id] = &graphQueryResult{kbID: id, kb: kb, err: fmt.Errorf("query failed: %v", err)}
 				mu.Unlock()
 				return
 			}
@@ -168,7 +173,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	// Collect and deduplicate results
 	seenChunks := make(map[string]*types.SearchResult)
 	var errors []string
-	graphConfigs := make(map[string]map[string]interface{})
+	graphConfigs := make(map[string]graphConfigSummary)
 	kbCounts := make(map[string]int)
 
 	for _, kbID := range input.KnowledgeBaseIDs {
@@ -179,10 +184,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		}
 
 		if result.kb != nil && result.kb.ExtractConfig != nil {
-			graphConfigs[kbID] = map[string]interface{}{
-				"nodes":     result.kb.ExtractConfig.Nodes,
-				"relations": result.kb.ExtractConfig.Relations,
-			}
+			graphConfigs[kbID] = summarizeGraphConfig(result.kb.ExtractConfig)
 		}
 
 		kbCounts[kbID] = len(result.results)
@@ -206,25 +208,26 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	if len(allResults) == 0 {
 		return &types.ToolResult{
 			Success: true,
-			Output:  "未找到相关的图谱信息。",
+			Output:  "No relevant graph information found.",
 			Data: map[string]interface{}{
 				"knowledge_base_ids": input.KnowledgeBaseIDs,
 				"query":              query,
 				"results":            []interface{}{},
-				"graph_configs":      graphConfigs,
+				"graph_configs":      graphConfigsToData(graphConfigs),
+				"graph_config":       aggregateGraphConfig(graphConfigs),
 				"errors":             errors,
 			},
 		}, nil
 	}
 
 	// Format output with enhanced graph information
-	output := "=== 知识图谱查询 ===\n\n"
-	output += fmt.Sprintf("📊 查询: %s\n", query)
-	output += fmt.Sprintf("🎯 目标知识库: %v\n", input.KnowledgeBaseIDs)
-	output += fmt.Sprintf("✓ 找到 %d 条相关结果（已去重）\n\n", len(allResults))
+	output := "=== Knowledge Graph Query ===\n\n"
+	output += fmt.Sprintf("📊 Query: %s\n", query)
+	output += fmt.Sprintf("🎯 Target Knowledge Bases: %v\n", input.KnowledgeBaseIDs)
+	output += fmt.Sprintf("✓ Found %d relevant results (deduplicated)\n\n", len(allResults))
 
 	if len(errors) > 0 {
-		output += "=== ⚠️ 部分失败 ===\n"
+		output += "=== ⚠️ Partial Failures ===\n"
 		for _, errMsg := range errors {
 			output += fmt.Sprintf("  - %s\n", errMsg)
 		}
@@ -233,66 +236,45 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 
 	// Display graph configuration status
 	hasGraphConfig := false
-	output += "=== 📈 图谱配置状态 ===\n\n"
+	output += "=== 📈 Graph Configuration Status ===\n\n"
 	for kbID, config := range graphConfigs {
 		hasGraphConfig = true
-		output += fmt.Sprintf("知识库【%s】:\n", kbID)
+		output += fmt.Sprintf("Knowledge Base [%s]:\n", kbID)
 
-		nodes, _ := config["nodes"].([]interface{})
-		relations, _ := config["relations"].([]interface{})
-
-		if len(nodes) > 0 {
-			output += fmt.Sprintf("  ✓ 实体类型 (%d): ", len(nodes))
-			nodeNames := make([]string, 0, len(nodes))
-			for _, n := range nodes {
-				if nodeMap, ok := n.(map[string]interface{}); ok {
-					if name, ok := nodeMap["name"].(string); ok {
-						nodeNames = append(nodeNames, name)
-					}
-				}
-			}
-			output += fmt.Sprintf("%v\n", nodeNames)
+		if len(config.Nodes) > 0 {
+			output += fmt.Sprintf("  ✓ Entity Types (%d): %v\n", len(config.Nodes), config.Nodes)
 		} else {
-			output += "  ⚠️ 未配置实体类型\n"
+			output += "  ⚠️ No entity types configured\n"
 		}
 
-		if len(relations) > 0 {
-			output += fmt.Sprintf("  ✓ 关系类型 (%d): ", len(relations))
-			relNames := make([]string, 0, len(relations))
-			for _, r := range relations {
-				if relMap, ok := r.(map[string]interface{}); ok {
-					if name, ok := relMap["name"].(string); ok {
-						relNames = append(relNames, name)
-					}
-				}
-			}
-			output += fmt.Sprintf("%v\n", relNames)
+		if len(config.Relations) > 0 {
+			output += fmt.Sprintf("  ✓ Relationship Types (%d): %v\n", len(config.Relations), config.Relations)
 		} else {
-			output += "  ⚠️ 未配置关系类型\n"
+			output += "  ⚠️ No relationship types configured\n"
 		}
 		output += "\n"
 	}
 
 	if !hasGraphConfig {
-		output += "⚠️ 所查询的知识库均未配置图谱抽取\n"
-		output += "💡 提示: 需要在知识库设置中配置实体和关系类型\n\n"
+		output += "⚠️ None of the queried knowledge bases have graph extraction configured\n"
+		output += "💡 Hint: Configure entity and relationship types in knowledge base settings\n\n"
 	}
 
 	// Display result counts by KB
 	if len(kbCounts) > 0 {
-		output += "=== 📚 知识库覆盖 ===\n"
+		output += "=== 📚 Knowledge Base Coverage ===\n"
 		for kbID, count := range kbCounts {
-			output += fmt.Sprintf("  - %s: %d 条结果\n", kbID, count)
+			output += fmt.Sprintf("  - %s: %d results\n", kbID, count)
 		}
 		output += "\n"
 	}
 
 	// Display search results
-	output += "=== 🔍 查询结果 ===\n\n"
+	output += "=== 🔍 Query Results ===\n\n"
 	if !hasGraphConfig {
-		output += "💡 当前返回相关文档片段（知识库未配置图谱）\n\n"
+		output += "💡 Returning relevant document chunks (knowledge base has no graph configuration)\n\n"
 	} else {
-		output += "💡 基于图谱配置的相关内容检索\n\n"
+		output += "💡 Content retrieval based on graph configuration\n\n"
 	}
 
 	formattedResults := make([]map[string]interface{}, 0, len(allResults))
@@ -305,15 +287,15 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			if i > 0 {
 				output += "\n"
 			}
-			output += fmt.Sprintf("【来源文档: %s】\n\n", result.KnowledgeTitle)
+			output += fmt.Sprintf("[Source Document: %s]\n\n", result.KnowledgeTitle)
 		}
 
 		relevanceLevel := GetRelevanceLevel(result.Score)
 
-		output += fmt.Sprintf("结果 #%d:\n", i+1)
-		output += fmt.Sprintf("  📍 相关度: %.2f (%s)\n", result.Score, relevanceLevel)
-		output += fmt.Sprintf("  🔗 匹配方式: %s\n", FormatMatchType(result.MatchType))
-		output += fmt.Sprintf("  📄 内容: %s\n", result.Content)
+		output += fmt.Sprintf("Result #%d:\n", i+1)
+		output += fmt.Sprintf("  📍 Relevance: %.2f (%s)\n", result.Score, relevanceLevel)
+		output += fmt.Sprintf("  🔗 Match Type: %s\n", FormatMatchType(result.MatchType))
+		output += fmt.Sprintf("  📄 Content: %s\n", result.Content)
 		output += fmt.Sprintf("  🆔 chunk_id: %s\n\n", result.ID)
 
 		formattedResults = append(formattedResults, map[string]interface{}{
@@ -328,17 +310,17 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		})
 	}
 
-	output += "=== 💡 使用提示 ===\n"
-	output += "- ✓ 结果已跨知识库去重并按相关度排序\n"
-	output += "- ✓ 使用 get_chunk_detail 获取完整内容\n"
-	output += "- ✓ 使用 list_knowledge_chunks 探索上下文\n"
+	output += "=== 💡 Tips ===\n"
+	output += "- ✓ Results are deduplicated across knowledge bases and sorted by relevance\n"
+	output += "- ✓ Use get_chunk_detail to get full content\n"
+	output += "- ✓ Use list_knowledge_chunks to explore context\n"
 	if !hasGraphConfig {
-		output += "- ⚠️ 配置图谱抽取以获得更精准的实体关系结果\n"
+		output += "- ⚠️ Configure graph extraction for more precise entity-relationship results\n"
 	}
-	output += "- ⏳ 完整的图查询语言（Cypher）支持开发中\n"
+	output += "- ⏳ Full graph query language (Cypher) support is under development\n"
 
 	// Build structured graph data for frontend visualization
-	graphData := buildGraphVisualizationData(allResults, graphConfigs)
+	graphData := buildGraphVisualizationData(allResults)
 
 	return &types.ToolResult{
 		Success: true,
@@ -349,7 +331,8 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			"results":            formattedResults,
 			"count":              len(allResults),
 			"kb_counts":          kbCounts,
-			"graph_configs":      graphConfigs,
+			"graph_configs":      graphConfigsToData(graphConfigs),
+			"graph_config":       aggregateGraphConfig(graphConfigs),
 			"graph_data":         graphData,
 			"has_graph_config":   hasGraphConfig,
 			"errors":             errors,
@@ -358,11 +341,102 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	}, nil
 }
 
+func summarizeGraphConfig(config *types.ExtractConfig) graphConfigSummary {
+	if config == nil {
+		return graphConfigSummary{}
+	}
+
+	return graphConfigSummary{
+		Nodes:     uniqueSortedNodeNames(config.Nodes),
+		Relations: uniqueSortedRelationNames(config.Relations),
+	}
+}
+
+func uniqueSortedNodeNames(nodes []*types.GraphNode) []string {
+	seen := make(map[string]struct{}, len(nodes))
+	names := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil || node.Name == "" {
+			continue
+		}
+		if _, exists := seen[node.Name]; exists {
+			continue
+		}
+		seen[node.Name] = struct{}{}
+		names = append(names, node.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func uniqueSortedRelationNames(relations []*types.GraphRelation) []string {
+	seen := make(map[string]struct{}, len(relations))
+	names := make([]string, 0, len(relations))
+	for _, relation := range relations {
+		if relation == nil || relation.Type == "" {
+			continue
+		}
+		if _, exists := seen[relation.Type]; exists {
+			continue
+		}
+		seen[relation.Type] = struct{}{}
+		names = append(names, relation.Type)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func graphConfigsToData(graphConfigs map[string]graphConfigSummary) map[string]map[string]interface{} {
+	if len(graphConfigs) == 0 {
+		return nil
+	}
+
+	data := make(map[string]map[string]interface{}, len(graphConfigs))
+	for kbID, config := range graphConfigs {
+		data[kbID] = map[string]interface{}{
+			"nodes":     config.Nodes,
+			"relations": config.Relations,
+		}
+	}
+	return data
+}
+
+func aggregateGraphConfig(graphConfigs map[string]graphConfigSummary) map[string]interface{} {
+	if len(graphConfigs) == 0 {
+		return nil
+	}
+
+	merged := graphConfigSummary{}
+	for _, config := range graphConfigs {
+		merged.Nodes = append(merged.Nodes, config.Nodes...)
+		merged.Relations = append(merged.Relations, config.Relations...)
+	}
+
+	return map[string]interface{}{
+		"nodes":     uniqueStrings(merged.Nodes),
+		"relations": uniqueStrings(merged.Relations),
+	}
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
 // buildGraphVisualizationData builds structured data for graph visualization
-func buildGraphVisualizationData(
-	results []*types.SearchResult,
-	graphConfigs map[string]map[string]interface{},
-) map[string]interface{} {
+func buildGraphVisualizationData(results []*types.SearchResult) map[string]interface{} {
 	// Build a simple graph structure for frontend visualization
 	nodes := make([]map[string]interface{}, 0)
 	edges := make([]map[string]interface{}, 0)

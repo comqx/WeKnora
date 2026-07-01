@@ -3,13 +3,15 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
-	secutils "github.com/Tencent/WeKnora/internal/utils"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -48,6 +50,16 @@ type MCPClient interface {
 // ClientConfig represents configuration for creating an MCP client
 type ClientConfig struct {
 	Service *types.MCPService
+
+	// OAuth wiring (only used when Service.AuthConfig.AuthType == oauth).
+	// The token store is scoped to (TenantID, Principal, Service.ID) so each
+	// identity connects with its own access/refresh token.
+	TenantID  uint64
+	Principal types.Principal
+	// UserID is kept for compatibility with older call sites/tests. New code
+	// should pass Principal.
+	UserID    string
+	OAuthRepo interfaces.MCPOAuthRepository
 }
 
 // mcpGoClient wraps mark3labs/mcp-go client to implement our MCPClient interface
@@ -56,6 +68,80 @@ type mcpGoClient struct {
 	client      *client.Client
 	connected   bool
 	initialized bool
+}
+
+// applyAuthHeaders injects the auth header for the SELECTED strategy only —
+// driven by AuthType so static API key / bearer are mutually exclusive (the old
+// code emitted both whenever the fields happened to be set, which double-authed
+// after a strategy switch). OAuth is handled separately by the caller.
+// CustomHeaders are always layered on top regardless of strategy and may
+// override the strategy header.
+func applyAuthHeaders(headers map[string]string, ac *types.MCPAuthConfig) {
+	if ac == nil {
+		return
+	}
+	switch ac.AuthType {
+	case types.MCPAuthAPIKey:
+		if ac.APIKey != "" {
+			name := ac.APIKeyHeader
+			if name == "" {
+				name = "X-API-Key"
+			}
+			headers[name] = ac.APIKey
+		}
+	case types.MCPAuthBearer:
+		if ac.Token != "" {
+			headers["Authorization"] = "Bearer " + ac.Token
+		}
+	case types.MCPAuthNone:
+		// Backward compatibility for rows that predate AuthType: infer from
+		// whichever static credential is set, preserving the historical
+		// behavior so existing services keep authenticating after upgrade.
+		if ac.APIKey != "" {
+			headers["X-API-Key"] = ac.APIKey
+		}
+		if ac.Token != "" {
+			headers["Authorization"] = "Bearer " + ac.Token
+		}
+	}
+	for key, value := range ac.CustomHeaders {
+		headers[key] = value
+	}
+}
+
+// OAuthRequiredError signals that the target MCP server requires OAuth
+// authorization — it answered the connect/initialize handshake with a 401 that
+// advertised RFC 9728 protected-resource metadata — even though the service was
+// NOT configured to use OAuth. Callers use this to guide the user to switch the
+// auth strategy to OAuth instead of surfacing a generic "401" failure.
+type OAuthRequiredError struct {
+	// MetadataURL is the RFC 9728 protected-resource metadata URL advertised by
+	// the server via the WWW-Authenticate header. Non-empty by construction
+	// (asOAuthRequired only wraps when the server advertised it).
+	MetadataURL string
+	Err         error
+}
+
+func (e *OAuthRequiredError) Error() string {
+	return fmt.Sprintf("the MCP server requires OAuth authorization: %v", e.Err)
+}
+
+func (e *OAuthRequiredError) Unwrap() error { return e.Err }
+
+// asOAuthRequired inspects err for a transport-level authorization-required
+// signal that carries RFC 9728 protected-resource metadata. It returns a
+// non-nil *OAuthRequiredError ONLY when the server advertised a metadata URL —
+// a bare 401 without metadata is treated as an ordinary auth failure (e.g. a
+// wrong/missing API key) so we don't misdirect the user toward OAuth.
+func asOAuthRequired(err error) *OAuthRequiredError {
+	if err == nil {
+		return nil
+	}
+	var authErr *transport.AuthorizationRequiredError
+	if errors.As(err, &authErr) && authErr.ResourceMetadataURL != "" {
+		return &OAuthRequiredError{MetadataURL: authErr.ResourceMetadataURL, Err: err}
+	}
+	return nil
 }
 
 // NewMCPClient creates a new MCP client based on the transport type
@@ -75,34 +161,35 @@ func NewMCPClient(config *ClientConfig) (MCPClient, error) {
 	for key, value := range config.Service.Headers {
 		headers[key] = value
 	}
+	applyAuthHeaders(headers, config.Service.AuthConfig)
 
-	// Add auth headers
-	if config.Service.AuthConfig != nil {
-		if config.Service.AuthConfig.APIKey != "" {
-			headers["X-API-Key"] = config.Service.AuthConfig.APIKey
-		}
-		if config.Service.AuthConfig.Token != "" {
-			headers["Authorization"] = "Bearer " + config.Service.AuthConfig.Token
-		}
-		if config.Service.AuthConfig.CustomHeaders != nil {
-			for key, value := range config.Service.AuthConfig.CustomHeaders {
-				headers[key] = value
-			}
-		}
+	// Build OAuth config when this service uses the OAuth strategy. The
+	// client_id comes from the dynamically-registered client persisted at
+	// authorization time; the token store loads the invoking user's token
+	// and transparently refreshes it.
+	oauthConfig, useOAuth, err := buildOAuthConfig(config, httpClient)
+	if err != nil {
+		return nil, err
 	}
 
 	// Create client based on transport type
 	var mcpClient *client.Client
-	var err error
 	switch config.Service.TransportType {
 	case types.MCPTransportSSE:
 		if config.Service.URL == nil || *config.Service.URL == "" {
 			return nil, fmt.Errorf("URL is required for SSE transport")
 		}
-		mcpClient, err = client.NewSSEMCPClient(*config.Service.URL,
-			client.WithHTTPClient(httpClient),
-			client.WithHeaders(headers),
-		)
+		if useOAuth {
+			mcpClient, err = client.NewOAuthSSEClient(*config.Service.URL, oauthConfig,
+				transport.WithHTTPClient(httpClient),
+				transport.WithHeaders(headers),
+			)
+		} else {
+			mcpClient, err = client.NewSSEMCPClient(*config.Service.URL,
+				client.WithHTTPClient(httpClient),
+				client.WithHeaders(headers),
+			)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to create SSE client: %w", err)
 		}
@@ -110,53 +197,95 @@ func NewMCPClient(config *ClientConfig) (MCPClient, error) {
 		if config.Service.URL == nil || *config.Service.URL == "" {
 			return nil, fmt.Errorf("URL is required for HTTP Streamable transport")
 		}
-		// For HTTP streamable, we need to use transport options
-		mcpClient, err = client.NewStreamableHttpClient(*config.Service.URL,
-			transport.WithHTTPBasicClient(httpClient),
-			transport.WithHTTPHeaders(headers),
-		)
+		if useOAuth {
+			mcpClient, err = client.NewOAuthStreamableHttpClient(*config.Service.URL, oauthConfig,
+				transport.WithHTTPBasicClient(httpClient),
+				transport.WithHTTPHeaders(headers),
+			)
+		} else {
+			// For HTTP streamable, we need to use transport options
+			mcpClient, err = client.NewStreamableHttpClient(*config.Service.URL,
+				transport.WithHTTPBasicClient(httpClient),
+				transport.WithHTTPHeaders(headers),
+			)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HTTP streamable client: %w", err)
 		}
 	case types.MCPTransportStdio:
-		if config.Service.StdioConfig == nil {
-			return nil, fmt.Errorf("stdio_config is required for stdio transport")
-		}
-
-		// Security validation: validate command, args, and env vars before execution
-		// This prevents command injection attacks (CWE-78)
-		if err := secutils.ValidateStdioConfig(
-			config.Service.StdioConfig.Command,
-			config.Service.StdioConfig.Args,
-			config.Service.EnvVars,
-		); err != nil {
-			return nil, fmt.Errorf("stdio configuration validation failed: %w", err)
-		}
-
-		// Convert env vars map to []string format (KEY=value)
-		envVars := make([]string, 0, len(config.Service.EnvVars))
-		for key, value := range config.Service.EnvVars {
-			envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
-		}
-
-		// Create stdio client with options
-		// NewStdioMCPClientWithOptions(command string, env []string, args []string, opts ...transport.StdioOption)
-		mcpClient, err = client.NewStdioMCPClientWithOptions(
-			config.Service.StdioConfig.Command,
-			envVars,
-			config.Service.StdioConfig.Args,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create stdio client: %w", err)
-		}
+		// Stdio transport is disabled for security reasons (potential command injection vulnerabilities)
+		return nil, fmt.Errorf("stdio transport is disabled for security reasons; please use SSE or HTTP Streamable transport instead")
 	default:
 		return nil, ErrUnsupportedTransport
 	}
 
-	return &mcpGoClient{
+	instance := &mcpGoClient{
 		service: config.Service,
 		client:  mcpClient,
-	}, nil
+	}
+	mcpClient.OnConnectionLost(instance.onConnectionLost)
+	return instance, nil
+}
+
+// buildOAuthConfig returns the OAuth configuration for an OAuth-enabled MCP
+// service, or (_, false, nil) when the service does not use OAuth. It loads
+// the dynamically-registered client_id and wires a per-user token store so
+// the transport injects the invoking user's bearer token and refreshes it.
+func buildOAuthConfig(config *ClientConfig, httpClient *http.Client) (transport.OAuthConfig, bool, error) {
+	svc := config.Service
+	if !svc.AuthConfig.IsOAuth() {
+		return transport.OAuthConfig{}, false, nil
+	}
+	if config.OAuthRepo == nil {
+		return transport.OAuthConfig{}, false, fmt.Errorf("OAuth repository is required for OAuth MCP services")
+	}
+	principal := config.Principal.Normalize()
+	if !principal.Valid() && config.UserID != "" {
+		principal = types.Principal{Type: types.PrincipalWebUser, ID: config.UserID}.Normalize()
+	}
+	if !principal.Valid() {
+		return transport.OAuthConfig{}, false, fmt.Errorf("principal context is required to connect to an OAuth MCP service")
+	}
+
+	oauthCfg := transport.OAuthConfig{
+		Scopes:                svc.AuthConfig.Scopes,
+		TokenStore:            newDBTokenStore(config.OAuthRepo, config.TenantID, principal, svc.ID),
+		PKCEEnabled:           true,
+		AuthServerMetadataURL: svc.AuthConfig.AuthServerMetadataURL,
+		HTTPClient:            httpClient,
+	}
+	if regClient, err := config.OAuthRepo.GetClient(context.Background(), config.TenantID, svc.ID); err == nil && regClient != nil {
+		oauthCfg.ClientID = regClient.ClientID
+		oauthCfg.ClientSecret = regClient.ClientSecret
+		oauthCfg.RedirectURI = regClient.RedirectURI
+	}
+	return oauthCfg, true, nil
+}
+
+// onConnectionLost callback when the connection is lost
+func (c *mcpGoClient) onConnectionLost(err error) {
+	_ = c.Disconnect()
+	logger.Warnf(context.Background(), "MCP server connection has been lost, URL:%s, error:%v", *c.service.URL, err)
+}
+
+// checkErrorAndDisconnectIfNeeded checks for transport errors that indicate the
+// session is no longer valid and proactively disconnects the client so that
+// subsequent GetOrCreateClient calls will establish a fresh connection.
+// Both SSE and HTTP Streamable transports use server-assigned sessions
+// (via Mcp-Session-Id header) that can expire or be invalidated.
+func (c *mcpGoClient) checkErrorAndDisconnectIfNeeded(err error) {
+	var transportErr *transport.Error
+	if !errors.As(err, &transportErr) || transportErr.Err == nil {
+		return
+	}
+	errMsg := transportErr.Err.Error()
+	// Known session invalidation errors from MCP servers:
+	//   - "Invalid session ID"  — server recognises the header but rejects the value
+	//   - "No active connection" — server has no record of the session at all
+	if strings.Contains(errMsg, "Invalid session ID") ||
+		strings.Contains(errMsg, "No active connection") {
+		_ = c.Disconnect()
+	}
 }
 
 // Connect establishes connection to the MCP service
@@ -167,9 +296,11 @@ func (c *mcpGoClient) Connect(ctx context.Context) error {
 
 	// Start the client
 	if err := c.client.Start(ctx); err != nil {
+		if oerr := asOAuthRequired(err); oerr != nil {
+			return oerr
+		}
 		return fmt.Errorf("failed to start client: %w", err)
 	}
-
 	c.connected = true
 	if c.service.TransportType == types.MCPTransportStdio {
 		logger.GetLogger(ctx).Infof("MCP stdio client connected: %s %v",
@@ -190,7 +321,6 @@ func (c *mcpGoClient) Disconnect() error {
 	if c.client != nil {
 		c.client.Close()
 	}
-
 	c.connected = false
 	c.initialized = false
 	return nil
@@ -216,6 +346,10 @@ func (c *mcpGoClient) Initialize(ctx context.Context) (*InitializeResult, error)
 
 	result, err := c.client.Initialize(ctx, req)
 	if err != nil {
+		c.checkErrorAndDisconnectIfNeeded(err)
+		if oerr := asOAuthRequired(err); oerr != nil {
+			return nil, oerr
+		}
 		return nil, fmt.Errorf("failed to initialize: %w", err)
 	}
 
@@ -224,8 +358,10 @@ func (c *mcpGoClient) Initialize(ctx context.Context) (*InitializeResult, error)
 	return &InitializeResult{
 		ProtocolVersion: result.ProtocolVersion,
 		ServerInfo: ServerInfo{
-			Name:    result.ServerInfo.Name,
-			Version: result.ServerInfo.Version,
+			Name:        result.ServerInfo.Name,
+			Version:     result.ServerInfo.Version,
+			Title:       result.ServerInfo.Title,
+			Description: result.ServerInfo.Description,
 		},
 	}, nil
 }
@@ -239,6 +375,7 @@ func (c *mcpGoClient) ListTools(ctx context.Context) ([]*types.MCPTool, error) {
 	req := mcp.ListToolsRequest{}
 	result, err := c.client.ListTools(ctx, req)
 	if err != nil {
+		c.checkErrorAndDisconnectIfNeeded(err)
 		return nil, fmt.Errorf("failed to list tools: %w", err)
 	}
 
@@ -265,6 +402,7 @@ func (c *mcpGoClient) ListResources(ctx context.Context) ([]*types.MCPResource, 
 	req := mcp.ListResourcesRequest{}
 	result, err := c.client.ListResources(ctx, req)
 	if err != nil {
+		c.checkErrorAndDisconnectIfNeeded(err)
 		return nil, fmt.Errorf("failed to list resources: %w", err)
 	}
 
@@ -297,6 +435,7 @@ func (c *mcpGoClient) CallTool(ctx context.Context, name string, args map[string
 
 	result, err := c.client.CallTool(ctx, req)
 	if err != nil {
+		c.checkErrorAndDisconnectIfNeeded(err)
 		return nil, fmt.Errorf("failed to call tool: %w", err)
 	}
 
@@ -337,6 +476,7 @@ func (c *mcpGoClient) ReadResource(ctx context.Context, uri string) (*ReadResour
 
 	result, err := c.client.ReadResource(ctx, req)
 	if err != nil {
+		c.checkErrorAndDisconnectIfNeeded(err)
 		return nil, fmt.Errorf("failed to read resource: %w", err)
 	}
 

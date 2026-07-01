@@ -26,6 +26,7 @@ show_help() {
     echo "  -p, --app      仅构建应用镜像"
     echo "  -d, --docreader 仅构建文档读取器镜像"
     echo "  -f, --frontend 仅构建前端镜像"
+    echo "  -s, --sandbox  仅构建沙箱镜像"
     echo "  -c, --clean    清理所有本地镜像"
     echo "  -v, --version  显示版本信息"
     exit 0
@@ -164,6 +165,7 @@ build_docreader_image() {
         --platform $PLATFORM \
         --build-arg PLATFORM=$PLATFORM \
         --build-arg TARGETARCH=$TARGETARCH \
+        --build-arg APT_MIRROR=${APT_MIRROR:-} \
         -f docker/Dockerfile.docreader \
         -t wechatopenai/weknora-docreader:latest \
         .
@@ -183,6 +185,12 @@ build_frontend_image() {
     
     cd "$PROJECT_ROOT"
     
+    # 获取版本信息（用于注入前端 commit hash）
+    get_version_info
+
+    log_info "构建前端静态资源..."
+    VITE_IS_DOCKER=true VITE_FRONTEND_COMMIT="$COMMIT_ID" "$SCRIPT_DIR/build_frontend_dist.sh"
+
     docker build \
         --platform $PLATFORM \
         -f frontend/Dockerfile \
@@ -198,26 +206,52 @@ build_frontend_image() {
     fi
 }
 
+# 构建沙箱镜像
+build_sandbox_image() {
+    log_info "构建沙箱镜像 (weknora-sandbox)..."
+
+    cd "$PROJECT_ROOT"
+
+    docker build \
+        --platform $PLATFORM \
+        -f docker/Dockerfile.sandbox \
+        -t wechatopenai/weknora-sandbox:latest \
+        .
+
+    if [ $? -eq 0 ]; then
+        log_success "沙箱镜像构建成功"
+        return 0
+    else
+        log_error "沙箱镜像构建失败"
+        return 1
+    fi
+}
+
 # 构建所有镜像
 build_all_images() {
     log_info "开始构建所有镜像..."
-    
+
     local app_result=0
     local docreader_result=0
     local frontend_result=0
-    
+    local sandbox_result=0
+
     # 构建应用镜像
     build_app_image
     app_result=$?
-    
+
     # 构建文档读取器镜像
     build_docreader_image
     docreader_result=$?
-    
+
     # 构建前端镜像
     build_frontend_image
     frontend_result=$?
-    
+
+    # 构建沙箱镜像
+    build_sandbox_image
+    sandbox_result=$?
+
     # 显示构建结果
     echo ""
     log_info "=== 构建结果 ==="
@@ -226,20 +260,26 @@ build_all_images() {
     else
         log_error "✗ 应用镜像构建失败"
     fi
-    
+
     if [ $docreader_result -eq 0 ]; then
         log_success "✓ 文档读取器镜像构建成功"
     else
         log_error "✗ 文档读取器镜像构建失败"
     fi
-    
+
     if [ $frontend_result -eq 0 ]; then
         log_success "✓ 前端镜像构建成功"
     else
         log_error "✗ 前端镜像构建失败"
     fi
-    
-    if [ $app_result -eq 0 ] && [ $docreader_result -eq 0 ] && [ $frontend_result -eq 0 ]; then
+
+    if [ $sandbox_result -eq 0 ]; then
+        log_success "✓ 沙箱镜像构建成功"
+    else
+        log_error "✗ 沙箱镜像构建失败"
+    fi
+
+    if [ $app_result -eq 0 ] && [ $docreader_result -eq 0 ] && [ $frontend_result -eq 0 ] && [ $sandbox_result -eq 0 ]; then
         log_success "所有镜像构建完成！"
         return 0
     else
@@ -269,6 +309,7 @@ clean_images() {
     docker rmi wechatopenai/weknora-app:latest 2>/dev/null || true
     docker rmi wechatopenai/weknora-docreader:latest 2>/dev/null || true
     docker rmi wechatopenai/weknora-ui:latest 2>/dev/null || true
+    docker rmi wechatopenai/weknora-sandbox:latest 2>/dev/null || true
     
     docker image prune -f
     
@@ -281,6 +322,7 @@ BUILD_ALL=false
 BUILD_APP=false
 BUILD_DOCREADER=false
 BUILD_FRONTEND=false
+BUILD_SANDBOX=false
 CLEAN_IMAGES=false
 
 # 没有参数时默认构建所有镜像
@@ -299,6 +341,8 @@ while [ "$1" != "" ]; do
         -d | --docreader )  BUILD_DOCREADER=true
                             ;;
         -f | --frontend )   BUILD_FRONTEND=true
+                            ;;
+        -s | --sandbox )    BUILD_SANDBOX=true
                             ;;
         -c | --clean )      CLEAN_IMAGES=true
                             ;;
@@ -347,4 +391,9 @@ if [ "$BUILD_FRONTEND" = true ]; then
     exit $?
 fi
 
-exit 0 
+if [ "$BUILD_SANDBOX" = true ]; then
+    build_sandbox_image
+    exit $?
+fi
+
+exit 0

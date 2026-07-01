@@ -6,6 +6,7 @@
       :placeholder="placeholderText"
       :disabled="disabled"
       :loading="loading"
+      :status="status"
       filterable
       style="width: 100%;"
     >
@@ -14,12 +15,13 @@
         v-for="model in models"
         :key="model.id"
         :value="model.id"
-        :label="model.name"
+        :label="modelDisplayName(model)"
       >
         <div class="model-option">
           <t-icon name="check-circle-filled" class="model-icon" />
-          <span class="model-name">{{ model.name }}</span>
-          <t-tag v-if="model.is_builtin" size="small" theme="primary">内置</t-tag>
+          <span class="model-name">{{ modelDisplayName(model) }}</span>
+          <span v-if="model.display_name" class="model-raw-name">{{ model.name }}</span>
+          <t-tag v-if="model.is_builtin" size="small" theme="primary">{{ $t('model.builtinTag') }}</t-tag>
           <t-tag v-if="model.is_default" size="small" theme="success">{{ $t('model.defaultTag') }}</t-tag>
         </div>
       </t-option>
@@ -46,17 +48,19 @@ import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
 
 interface Props {
-  modelType: 'KnowledgeQA' | 'Embedding' | 'Rerank' | 'VLLM'
+  modelType: 'KnowledgeQA' | 'Embedding' | 'Rerank' | 'VLLM' | 'ASR'
   selectedModelId?: string
   disabled?: boolean
   placeholder?: string
+  status?: 'default' | 'success' | 'warning' | 'error'
   // 可选：外部传入的所有模型列表，如果提供则不调用API
   allModels?: ModelConfig[]
 }
 
 const props = withDefaults(defineProps<Props>(), {
   disabled: false,
-  placeholder: ''
+  placeholder: '',
+  status: 'default',
 })
 
 const emit = defineEmits<{
@@ -71,6 +75,11 @@ const { t } = useI18n()
 const placeholderText = computed(() => {
   return props.placeholder || t('model.selectModelPlaceholder')
 })
+
+const modelDisplayName = (model: ModelConfig) => {
+  const displayName = model.display_name?.trim()
+  return displayName || model.name
+}
 
 // 监听 allModels 变化，自动过滤当前类型的模型
 watch(() => props.allModels, (newModels) => {
@@ -144,25 +153,38 @@ onMounted(() => {
   
   .model-icon {
     font-size: 14px;
-    color: #07C05F;
+    color: var(--td-brand-color);
   }
   
   .add-icon {
     font-size: 14px;
-    color: #07C05F;
+    color: var(--td-brand-color);
   }
   
   .model-name {
-    flex: 1;
+    flex: 0 1 auto;
+    min-width: 0;
     font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .model-raw-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--td-text-color-placeholder);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   
   &.add {
     .model-name {
-      color: #07C05F;
+      color: var(--td-brand-color);
       font-weight: 500;
     }
   }
 }
 </style>
-

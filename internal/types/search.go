@@ -15,6 +15,12 @@ const (
 	SearchTargetTypeKnowledge SearchTargetType = "knowledge"
 )
 
+// TagScope represents a tag-constrained retrieval scope inside one knowledge base.
+type TagScope struct {
+	KnowledgeBaseID string   `json:"knowledge_base_id"`
+	TagIDs          []string `json:"tag_ids"`
+}
+
 // SearchTarget represents a unified search target
 // Either search an entire knowledge base, or specific knowledge files within a knowledge base
 type SearchTarget struct {
@@ -22,9 +28,14 @@ type SearchTarget struct {
 	Type SearchTargetType `json:"type"`
 	// KnowledgeBaseID is the ID of the knowledge base to search
 	KnowledgeBaseID string `json:"knowledge_base_id"`
+	// TenantID is the tenant ID that owns this knowledge base
+	// Required for cross-tenant shared KB queries
+	TenantID uint64 `json:"tenant_id"`
 	// KnowledgeIDs is the list of specific knowledge IDs to search within the knowledge base
 	// Only used when Type is SearchTargetTypeKnowledge
 	KnowledgeIDs []string `json:"knowledge_ids,omitempty"`
+	// TagIDs limits retrieval to chunks/documents carrying any of these KB-local tags.
+	TagIDs []string `json:"tag_ids,omitempty"`
 }
 
 // SearchTargets is a list of search targets, pre-computed at request entry point
@@ -41,6 +52,38 @@ func (st SearchTargets) GetAllKnowledgeBaseIDs() []string {
 		}
 	}
 	return result
+}
+
+// GetKBTenantMap returns a map from knowledge base ID to tenant ID
+func (st SearchTargets) GetKBTenantMap() map[string]uint64 {
+	result := make(map[string]uint64)
+	for _, t := range st {
+		if t.KnowledgeBaseID != "" {
+			result[t.KnowledgeBaseID] = t.TenantID
+		}
+	}
+	return result
+}
+
+// GetTenantIDForKB returns the tenant ID for a given knowledge base ID
+// Returns 0 if not found
+func (st SearchTargets) GetTenantIDForKB(kbID string) uint64 {
+	for _, t := range st {
+		if t.KnowledgeBaseID == kbID {
+			return t.TenantID
+		}
+	}
+	return 0
+}
+
+// ContainsKB checks if the search targets contain a given knowledge base ID
+func (st SearchTargets) ContainsKB(kbID string) bool {
+	for _, t := range st {
+		if t.KnowledgeBaseID == kbID {
+			return true
+		}
+	}
+	return false
 }
 
 // SearchResult represents the search result
@@ -85,20 +128,43 @@ type SearchResult struct {
 	// Used to indicate the source of the knowledge, such as "url"
 	KnowledgeSource string `json:"knowledge_source"`
 
+	// KnowledgeChannel indicates through which channel the knowledge was ingested (web, api, wechat, etc.)
+	KnowledgeChannel string `json:"knowledge_channel"`
+
 	// ChunkMetadata stores chunk-level metadata (e.g., generated questions)
 	ChunkMetadata JSON `json:"chunk_metadata,omitempty"`
+
+	// MatchedContent is the actual content that was matched in vector search
+	// For FAQ: this is the matched question text (standard or similar question)
+	MatchedContent string `json:"matched_content,omitempty"`
+
+	// KnowledgeDescription is the description of the knowledge document
+	KnowledgeDescription string `json:"knowledge_description,omitempty"`
+
+	// KnowledgeBaseID is the ID of the knowledge base this result belongs to
+	KnowledgeBaseID string `json:"knowledge_base_id,omitempty"`
 }
 
 // SearchParams represents the search parameters
 type SearchParams struct {
-	QueryText            string   `json:"query_text"`
-	VectorThreshold      float64  `json:"vector_threshold"`
-	KeywordThreshold     float64  `json:"keyword_threshold"`
-	MatchCount           int      `json:"match_count"`
-	DisableKeywordsMatch bool     `json:"disable_keywords_match"`
-	DisableVectorMatch   bool     `json:"disable_vector_match"`
-	KnowledgeIDs         []string `json:"knowledge_ids"`
-	TagIDs               []string `json:"tag_ids"` // Tag IDs for filtering (used for FAQ priority filtering)
+	QueryText            string    `json:"query_text"`
+	QueryEmbedding       []float32 `json:"query_embedding,omitempty"`
+	VectorThreshold      float64   `json:"vector_threshold"`
+	KeywordThreshold     float64   `json:"keyword_threshold"`
+	MatchCount           int       `json:"match_count"`
+	DisableKeywordsMatch bool      `json:"disable_keywords_match"`
+	DisableVectorMatch   bool      `json:"disable_vector_match"`
+	KnowledgeIDs         []string  `json:"knowledge_ids"`
+	TagIDs               []string  `json:"tag_ids"` // Tag IDs for filtering (used for FAQ priority filtering)
+	OnlyRecommended      bool      `json:"only_recommended"`
+	// KnowledgeBaseIDs overrides the single KB ID passed to HybridSearch,
+	// allowing a single retrieval call to span multiple KBs that share the
+	// same embedding model. When empty, HybridSearch uses its own id parameter.
+	KnowledgeBaseIDs []string `json:"knowledge_base_ids,omitempty"`
+	// SkipContextEnrichment skips fetching parent, nearby, and relation chunks
+	// in processSearchResults. Used by the chat pipeline where context assembly
+	// is handled separately in the merge stage.
+	SkipContextEnrichment bool `json:"skip_context_enrichment,omitempty"`
 }
 
 // Value implements the driver.Valuer interface, used to convert SearchResult to database value
@@ -123,7 +189,7 @@ type Pagination struct {
 	// Page
 	Page int `form:"page"      json:"page"      binding:"omitempty,min=1"`
 	// Page size
-	PageSize int `form:"page_size" json:"page_size" binding:"omitempty,min=1,max=100"`
+	PageSize int `form:"page_size" json:"page_size" binding:"omitempty,min=1,max=1000"`
 }
 
 // GetPage gets the page number, default is 1
@@ -139,8 +205,8 @@ func (p *Pagination) GetPageSize() int {
 	if p.PageSize < 1 {
 		return 20
 	}
-	if p.PageSize > 100 {
-		return 100
+	if p.PageSize > 1000 {
+		return 1000
 	}
 	return p.PageSize
 }

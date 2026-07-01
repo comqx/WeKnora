@@ -12,19 +12,33 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ChunkHandler defines HTTP handlers for chunk operations
+// ChunkHandler defines HTTP handlers for chunk operations.
+//
+// All KB-access checks (own / org-shared / via shared agent) are now
+// performed by the route-level g.KBAccessRead*FromKnowledgeIDParam /
+// g.KBAccessWrite*FromKnowledgeIDParam / g.KBAccess*FromChunkIDParam
+// guards in router.go — the guard rewrites c.Request.Context() to
+// carry the effective tenant ID, so the handler reads tenant from
+// context the way it always did.
+//
+// kgService is retained because the route-level *creator-ownership*
+// lookup KBCreatorLookupFromKnowledgeIDParam still walks
+// knowledge_id -> kb_id to resolve creator_id (separate axis from
+// access — that lookup answers "is the caller the creator of THIS
+// resource", not "does the caller's tenant have access").
 type ChunkHandler struct {
-	service interfaces.ChunkService
+	service   interfaces.ChunkService
+	kgService interfaces.KnowledgeService
 }
 
-// NewChunkHandler creates a new chunk handler
-func NewChunkHandler(service interfaces.ChunkService) *ChunkHandler {
-	return &ChunkHandler{service: service}
+// NewChunkHandler creates a new chunk handler.
+func NewChunkHandler(service interfaces.ChunkService, kgService interfaces.KnowledgeService) *ChunkHandler {
+	return &ChunkHandler{service: service, kgService: kgService}
 }
 
 // GetChunkByIDOnly godoc
 // @Summary      通过ID获取分块
-// @Description  仅通过分块ID获取分块详情（不需要knowledge_id）
+// @Description  仅通过分块ID获取分块详情（不需要knowledge_id）；支持共享知识库下的分块访问
 // @Tags         分块管理
 // @Accept       json
 // @Produce      json
@@ -46,18 +60,10 @@ func (h *ChunkHandler) GetChunkByIDOnly(c *gin.Context) {
 		return
 	}
 
-	// Get tenant ID from context
-	tenantID, exists := c.Get(types.TenantIDContextKey.String())
-	if !exists {
-		logger.Error(ctx, "Failed to get tenant ID")
-		c.Error(errors.NewUnauthorizedError("Unauthorized"))
-		return
-	}
-
-	logger.Infof(ctx, "Retrieving chunk by ID, chunk ID: %s, tenant ID: %d", chunkID, tenantID)
-
-	// Get chunk by ID
-	chunk, err := h.service.GetChunkByID(ctx, chunkID)
+	// Get chunk by ID without tenant filter (chunk may belong to shared
+	// KB; the route-level KB-access guard already verified read
+	// permission against the parent KB before we got here).
+	chunk, err := h.service.GetChunkByIDOnly(ctx, chunkID)
 	if err != nil {
 		if err == service.ErrChunkNotFound {
 			logger.Warnf(ctx, "Chunk not found, chunk ID: %s", chunkID)
@@ -66,17 +72,6 @@ func (h *ChunkHandler) GetChunkByIDOnly(c *gin.Context) {
 		}
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
-		return
-	}
-
-	// Validate tenant ID
-	if chunk.TenantID != tenantID.(uint64) {
-		logger.Warnf(
-			ctx,
-			"Tenant has no permission to access chunk, chunk ID: %s, req tenant: %d, chunk tenant: %d",
-			chunkID, tenantID.(uint64), chunk.TenantID,
-		)
-		c.Error(errors.NewForbiddenError("No permission to access this chunk"))
 		return
 	}
 
@@ -133,9 +128,17 @@ func (h *ChunkHandler) ListKnowledgeChunks(c *gin.Context) {
 		pagination.PageSize = 100
 	}
 
+	// Default to text chunks; callers may override via ?chunk_type=image_caption etc.
 	chunkType := []types.ChunkType{types.ChunkTypeText}
+	if queryTypes := c.QueryArray("chunk_type"); len(queryTypes) > 0 {
+		chunkType = make([]types.ChunkType, 0, len(queryTypes))
+		for _, qt := range queryTypes {
+			chunkType = append(chunkType, types.ChunkType(qt))
+		}
+	}
 
-	// Use pagination for query
+	// The route-level guard has rewritten the request's tenant context
+	// to the effective tenant for shared KBs.
 	result, err := h.service.ListPagedChunksByKnowledgeID(ctx, knowledgeID, &pagination, chunkType)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
@@ -170,35 +173,25 @@ type UpdateChunkRequest struct {
 	ImageInfo  string    `json:"image_info"`
 }
 
-// validateAndGetChunk validates request parameters and retrieves the chunk
-// Returns chunk information, knowledge ID, and error
-func (h *ChunkHandler) validateAndGetChunk(c *gin.Context) (*types.Chunk, string, error) {
+// fetchChunkAndVerifyOwnership fetches a chunk by ID and verifies it
+// belongs to the URL :knowledge_id (defence in depth: the route-level
+// KB-access guard already ensured the caller has write access to the
+// KB; this check stops a same-tenant attacker from passing one
+// knowledge_id while addressing a chunk owned by a different
+// knowledge in the same KB).
+func (h *ChunkHandler) fetchChunkAndVerifyOwnership(c *gin.Context) (*types.Chunk, string, error) {
 	ctx := c.Request.Context()
 
-	// Validate knowledge ID
 	knowledgeID := secutils.SanitizeForLog(c.Param("knowledge_id"))
 	if knowledgeID == "" {
 		logger.Error(ctx, "Knowledge ID is empty")
 		return nil, "", errors.NewBadRequestError("Knowledge ID cannot be empty")
 	}
-
-	// Validate chunk ID
 	id := secutils.SanitizeForLog(c.Param("id"))
 	if id == "" {
 		logger.Error(ctx, "Chunk ID is empty")
 		return nil, knowledgeID, errors.NewBadRequestError("Chunk ID cannot be empty")
 	}
-
-	// Get tenant ID from context
-	tenantID, exists := c.Get(types.TenantIDContextKey.String())
-	if !exists {
-		logger.Error(ctx, "Failed to get tenant ID")
-		return nil, knowledgeID, errors.NewUnauthorizedError("Unauthorized")
-	}
-
-	logger.Infof(ctx, "Retrieving knowledge chunk information, knowledge ID: %s, chunk ID: %s", knowledgeID, id)
-
-	// Get existing chunk
 	chunk, err := h.service.GetChunkByID(ctx, id)
 	if err != nil {
 		if err == service.ErrChunkNotFound {
@@ -208,20 +201,10 @@ func (h *ChunkHandler) validateAndGetChunk(c *gin.Context) (*types.Chunk, string
 		logger.ErrorWithFields(ctx, err, nil)
 		return nil, knowledgeID, errors.NewInternalServerError(err.Error())
 	}
-
-	// Validate tenant ID
-	if chunk.TenantID != tenantID.(uint64) || chunk.KnowledgeID != knowledgeID {
-		logger.Warnf(
-			ctx,
-			"Tenant has no permission to access chunk, knowledge ID: %s, chunk ID: %s, req tenant: %d, chunk tenant: %d",
-			knowledgeID,
-			id,
-			tenantID,
-			chunk.TenantID,
-		)
+	if chunk.KnowledgeID != knowledgeID {
+		logger.Warnf(ctx, "Chunk does not belong to knowledge, knowledge ID: %s, chunk ID: %s", knowledgeID, id)
 		return nil, knowledgeID, errors.NewForbiddenError("No permission to access this chunk")
 	}
-
 	return chunk, knowledgeID, nil
 }
 
@@ -244,8 +227,7 @@ func (h *ChunkHandler) UpdateChunk(c *gin.Context) {
 	ctx := c.Request.Context()
 	logger.Info(ctx, "Start updating knowledge chunk")
 
-	// Validate parameters and get chunk
-	chunk, knowledgeID, err := h.validateAndGetChunk(c)
+	chunk, knowledgeID, err := h.fetchChunkAndVerifyOwnership(c)
 	if err != nil {
 		c.Error(err)
 		return
@@ -257,7 +239,6 @@ func (h *ChunkHandler) UpdateChunk(c *gin.Context) {
 		return
 	}
 
-	// Update chunk properties
 	if req.Content != "" {
 		chunk.Content = req.Content
 	}
@@ -296,8 +277,7 @@ func (h *ChunkHandler) DeleteChunk(c *gin.Context) {
 	ctx := c.Request.Context()
 	logger.Info(ctx, "Start deleting knowledge chunk")
 
-	// Validate parameters and get chunk
-	chunk, _, err := h.validateAndGetChunk(c)
+	chunk, _, err := h.fetchChunkAndVerifyOwnership(c)
 	if err != nil {
 		c.Error(err)
 		return
@@ -338,9 +318,7 @@ func (h *ChunkHandler) DeleteChunksByKnowledgeID(c *gin.Context) {
 		return
 	}
 
-	// Delete all chunks under the knowledge
-	err := h.service.DeleteChunksByKnowledgeID(ctx, knowledgeID)
-	if err != nil {
+	if err := h.service.DeleteChunksByKnowledgeID(ctx, knowledgeID); err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
@@ -386,34 +364,6 @@ func (h *ChunkHandler) DeleteGeneratedQuestion(c *gin.Context) {
 		return
 	}
 
-	// Get tenant ID from context
-	tenantID, exists := c.Get(types.TenantIDContextKey.String())
-	if !exists {
-		logger.Error(ctx, "Failed to get tenant ID")
-		c.Error(errors.NewUnauthorizedError("Unauthorized"))
-		return
-	}
-
-	// Verify chunk exists and belongs to tenant
-	chunk, err := h.service.GetChunkByID(ctx, chunkID)
-	if err != nil {
-		if err == service.ErrChunkNotFound {
-			logger.Warnf(ctx, "Chunk not found, chunk ID: %s", chunkID)
-			c.Error(errors.NewNotFoundError("Chunk not found"))
-			return
-		}
-		logger.ErrorWithFields(ctx, err, nil)
-		c.Error(errors.NewInternalServerError(err.Error()))
-		return
-	}
-
-	if chunk.TenantID != tenantID.(uint64) {
-		logger.Warnf(ctx, "Tenant has no permission to access chunk, chunk ID: %s", chunkID)
-		c.Error(errors.NewForbiddenError("No permission to access this chunk"))
-		return
-	}
-
-	// Delete the generated question by ID
 	if err := h.service.DeleteGeneratedQuestion(ctx, chunkID, req.QuestionID); err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewBadRequestError(err.Error()))

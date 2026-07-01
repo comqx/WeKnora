@@ -24,6 +24,7 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import { getRootZoom, rectToCssPx, cssViewportSize } from '@/utils/zoom'
 
 const props = defineProps<{
   content: string
@@ -51,8 +52,12 @@ const updatePosition = async () => {
   // 再次检查，确保DOM已渲染
   if (!tooltipRef.value) return
   
-  const rect = wrapperRef.value.getBoundingClientRect()
-  const tooltipRect = tooltipRef.value.getBoundingClientRect()
+  // The tooltip is `position: fixed` and rendered under the root `zoom`.
+  // Normalize the visual-pixel rects so subsequent arithmetic stays in CSS px.
+  const zoom = getRootZoom()
+  const rect = rectToCssPx(wrapperRef.value.getBoundingClientRect(), zoom)
+  const tooltipRect = rectToCssPx(tooltipRef.value.getBoundingClientRect(), zoom)
+  const { width: vw, height: vh } = cssViewportSize(zoom)
   const placement = props.placement || 'top'
   
   let top = 0
@@ -80,8 +85,8 @@ const updatePosition = async () => {
   // 边界检测
   const padding = 8
   if (left < padding) left = padding
-  if (left + tooltipRect.width > window.innerWidth - padding) {
-    left = window.innerWidth - tooltipRect.width - padding
+  if (left + tooltipRect.width > vw - padding) {
+    left = vw - tooltipRect.width - padding
   }
   if (top < padding) {
     // 如果上方空间不足，改为下方显示
@@ -91,8 +96,8 @@ const updatePosition = async () => {
       top = padding
     }
   }
-  if (top + tooltipRect.height > window.innerHeight - padding) {
-    top = window.innerHeight - tooltipRect.height - padding
+  if (top + tooltipRect.height > vh - padding) {
+    top = vh - tooltipRect.height - padding
   }
   
   tooltipStyle.value = {
@@ -166,12 +171,12 @@ watch(showTooltip, (newVal) => {
   max-width: 320px;
   min-width: 100px;
   padding: 10px 14px;
-  background: #FFFFFF;
-  color: #000000e6;
-  border: 1px solid #e7ebf0;
+  background: var(--td-bg-color-container);
+  color: var(--td-text-color-primary);
+  border: 1px solid var(--td-component-stroke);
   border-radius: 6px;
   box-shadow: 0 0 8px 0 rgba(0, 0, 0, 0.08);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.6;
@@ -190,7 +195,7 @@ watch(showTooltip, (newVal) => {
     bottom: -10px;
     left: 50%;
     transform: translateX(-50%);
-    border-top-color: #e7ebf0;
+    border-top-color: var(--td-component-stroke);
   }
 
   &.placement-top::after {
@@ -202,14 +207,14 @@ watch(showTooltip, (newVal) => {
     width: 0;
     height: 0;
     border: 5px solid transparent;
-    border-top-color: #FFFFFF;
+    border-top-color: var(--td-bg-color-container);
   }
 
   &.placement-bottom::before {
     top: -10px;
     left: 50%;
     transform: translateX(-50%);
-    border-bottom-color: #e7ebf0;
+    border-bottom-color: var(--td-component-stroke);
   }
 
   &.placement-bottom::after {
@@ -221,14 +226,14 @@ watch(showTooltip, (newVal) => {
     width: 0;
     height: 0;
     border: 5px solid transparent;
-    border-bottom-color: #FFFFFF;
+    border-bottom-color: var(--td-bg-color-container);
   }
 
   &.placement-left::before {
     right: -10px;
     top: 50%;
     transform: translateY(-50%);
-    border-left-color: #e7ebf0;
+    border-left-color: var(--td-component-stroke);
   }
 
   &.placement-left::after {
@@ -240,14 +245,14 @@ watch(showTooltip, (newVal) => {
     width: 0;
     height: 0;
     border: 5px solid transparent;
-    border-left-color: #FFFFFF;
+    border-left-color: var(--td-bg-color-container);
   }
 
   &.placement-right::before {
     left: -10px;
     top: 50%;
     transform: translateY(-50%);
-    border-right-color: #e7ebf0;
+    border-right-color: var(--td-component-stroke);
   }
 
   &.placement-right::after {
@@ -259,7 +264,7 @@ watch(showTooltip, (newVal) => {
     width: 0;
     height: 0;
     border: 5px solid transparent;
-    border-right-color: #FFFFFF;
+    border-right-color: var(--td-bg-color-container);
   }
 
   // 所有类型使用统一的常规边框颜色
@@ -272,8 +277,8 @@ watch(showTooltip, (newVal) => {
 }
 
 .tooltip-content {
-  color: #000000e6;
-  font-family: "PingFang SC";
+  color: var(--td-text-color-primary);
+  font-family: var(--app-font-family);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.6;

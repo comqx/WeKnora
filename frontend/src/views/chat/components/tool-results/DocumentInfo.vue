@@ -4,7 +4,7 @@
     <div v-if="documents.length" class="documents-list">
       <div
         v-for="(doc, index) in documents"
-        :key="doc.knowledge_id || index"
+        :key="doc.faq_id || doc.knowledge_id || index"
         class="result-card document-card"
       >
         <div class="result-header document-header">
@@ -20,9 +20,22 @@
         </div>
         <div class="result-content expanded">
           <div class="info-section">
-            <div class="info-field">
-              <span class="field-label">{{ $t('chat.documentIdLabel') }}</span>
+            <div class="info-field" v-if="doc.is_faq && doc.faq_id">
+              <span class="field-label">{{ $t('chat.faqIdLabel') }}</span>
+              <span class="field-value"><code>{{ doc.faq_id }}</code></span>
+            </div>
+            <div class="info-field" v-if="doc.knowledge_id">
+              <span class="field-label">{{ doc.is_faq ? $t('chat.faqContainerIdLabel') : $t('chat.documentIdLabel') }}</span>
               <span class="field-value"><code>{{ doc.knowledge_id }}</code></span>
+            </div>
+            <div
+              v-if="doc.is_faq && doc.faq_answers?.length"
+              class="info-field info-field--block"
+            >
+              <span class="field-label">{{ $t('chat.faqAnswersLabel') }}</span>
+              <ul class="faq-answers-list">
+                <li v-for="(ans, aIdx) in doc.faq_answers" :key="aIdx">{{ ans }}</li>
+              </ul>
             </div>
             <div class="info-field" v-if="doc.description">
               <span class="field-label">{{ $t('chat.documentDescriptionLabel') }}</span>
@@ -31,6 +44,10 @@
             <div class="info-field" v-if="doc.source || doc.type">
               <span class="field-label">{{ $t('chat.documentSourceLabel') }}</span>
               <span class="field-value">{{ formatSource(doc) }}</span>
+            </div>
+            <div class="info-field" v-if="doc.channel && doc.channel !== 'web'">
+              <span class="field-label">{{ $t('knowledgeBase.channelLabel') }}</span>
+              <span class="field-value">{{ getChannelLabel(doc.channel) }}</span>
             </div>
             <div class="info-field" v-if="doc.file_name || doc.file_type || doc.file_size">
               <span class="field-label">{{ $t('chat.documentFileLabel') }}</span>
@@ -84,6 +101,23 @@ const totalChunkCount = computed(() =>
   documents.value.reduce((sum, doc) => sum + (doc.chunk_count || 0), 0),
 );
 
+const channelLabelMap: Record<string, string> = {
+  web: 'knowledgeBase.channelWeb',
+  api: 'knowledgeBase.channelApi',
+  browser_extension: 'knowledgeBase.channelBrowserExtension',
+  wechat: 'knowledgeBase.channelWechat',
+  wecom: 'knowledgeBase.channelWecom',
+  feishu: 'knowledgeBase.channelFeishu',
+  dingtalk: 'knowledgeBase.channelDingtalk',
+  slack: 'knowledgeBase.channelSlack',
+  im: 'knowledgeBase.channelIm',
+};
+
+const getChannelLabel = (channel: string) => {
+  const key = channelLabelMap[channel];
+  return key ? t(key) : t('knowledgeBase.channelUnknown');
+};
+
 const formatSource = (doc: DocumentInfoDocument) => {
   if (doc.type && doc.source) {
     return `${doc.type} · ${doc.source}`;
@@ -132,8 +166,8 @@ const formatMetadataValue = (value: unknown) => {
 
 .meta-chip {
   font-size: 11px;
-  color: #6b7280;
-  background: #f9fafb;
+  color: var(--td-text-color-secondary);
+  background: var(--td-bg-color-secondarycontainer);
   border: 1px solid @card-border;
   border-radius: 10px;
   padding: 2px 8px;
@@ -156,18 +190,18 @@ const formatMetadataValue = (value: unknown) => {
 
   .doc-index {
     font-weight: 600;
-    color: #07c05f;
+    color: var(--td-brand-color);
   }
 
   .doc-title {
     font-size: 13px;
     font-weight: 500;
-    color: #374151;
+    color: var(--td-text-color-primary);
   }
 
   .status-pill {
     font-size: 11px;
-    color: #07c05f;
+    color: var(--td-brand-color);
     border: 1px solid rgba(7, 192, 95, 0.3);
     border-radius: 10px;
     padding: 2px 8px;
@@ -184,6 +218,21 @@ const formatMetadataValue = (value: unknown) => {
   }
 }
 
+.faq-answers-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  li {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--td-text-color-primary);
+  }
+}
+
 .info-field {
   display: flex;
   gap: 10px;
@@ -191,15 +240,20 @@ const formatMetadataValue = (value: unknown) => {
   font-size: 12px;
   line-height: 1.5;
 
+  &--block {
+    flex-direction: column;
+    gap: 4px;
+  }
+
   .field-label {
-    color: #6b7280;
+    color: var(--td-text-color-secondary);
     min-width: 90px;
     font-weight: 500;
   }
 
   .field-value {
     flex: 1;
-    color: #374151;
+    color: var(--td-text-color-primary);
     line-height: 1.5;
   }
 }
@@ -219,38 +273,38 @@ const formatMetadataValue = (value: unknown) => {
 
   li {
     font-size: 11px;
-    color: #374151;
+    color: var(--td-text-color-primary);
     line-height: 1.5;
   }
 
   .metadata-key {
     font-weight: 600;
     margin-right: 4px;
-    color: #6b7280;
+    color: var(--td-text-color-secondary);
   }
 
   .metadata-value {
-    font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
-    color: #374151;
+    font-family: var(--app-font-family-mono);
+    color: var(--td-text-color-primary);
   }
 }
 
 .empty-state {
   font-size: 12px;
-  color: #9ca3af;
+  color: var(--td-text-color-placeholder);
   text-align: center;
   padding: 14px;
   border: 1px dashed @card-border;
   border-radius: @card-radius;
-  background: #f9fafb;
+  background: var(--td-bg-color-secondarycontainer);
 }
 
 code {
-  font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+  font-family: var(--app-font-family-mono);
   font-size: 10px;
-  background: #f3f4f6;
+  background: var(--td-bg-color-secondarycontainer);
   padding: 2px 4px;
   border-radius: 2px;
-  color: #374151;
+  color: var(--td-text-color-primary);
 }
 </style>

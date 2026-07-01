@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 var getDocumentInfoTool = BaseTool{
@@ -40,13 +40,33 @@ Do not use when:
 
 - Concurrent query for multiple documents provides better performance
 - Returns complete document metadata, not just title
-- Can check document processing status (parse_status)`,
-	schema: utils.GenerateSchema[GetDocumentInfoInput](),
+- Can check document processing status (parse_status)
+
+## IDs
+- knowledge_ids: regular documents knowledges
+- faq_ids: individual FAQ entries. Returns the standard question and answers, not the container title.`,
+	schema: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "knowledge_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Document/knowledge IDs for regular documents"
+    },
+    "faq_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "FAQ entry IDs (= chunk_id from grep_chunks). Use instead of knowledge_ids for a single FAQ Q&A."
+    }
+  }
+}`),
 }
 
-// GetDocumentInfoInput defines the input parameters for get document info tool
+// GetDocumentInfoInput defines the input parameters for get document info tool.
+// Either knowledge_ids or faq_ids may be provided (at least one); both are optional in the schema.
 type GetDocumentInfoInput struct {
-	KnowledgeIDs []string `json:"knowledge_ids" jsonschema:"Array of document/knowledge IDs, obtained from knowledge_id field in search results, supports concurrent batch queries"`
+	KnowledgeIDs []string `json:"knowledge_ids,omitempty"`
+	FAQIDs       []string `json:"faq_ids,omitempty"`
 }
 
 // GetDocumentInfoTool retrieves detailed information about a document/knowledge
@@ -54,27 +74,25 @@ type GetDocumentInfoTool struct {
 	BaseTool
 	knowledgeService interfaces.KnowledgeService
 	chunkService     interfaces.ChunkService
+	searchTargets    types.SearchTargets // Pre-computed unified search targets with KB-tenant mapping
 }
 
 // NewGetDocumentInfoTool creates a new get document info tool
 func NewGetDocumentInfoTool(
 	knowledgeService interfaces.KnowledgeService,
 	chunkService interfaces.ChunkService,
+	searchTargets types.SearchTargets,
 ) *GetDocumentInfoTool {
 	return &GetDocumentInfoTool{
 		BaseTool:         getDocumentInfoTool,
 		knowledgeService: knowledgeService,
 		chunkService:     chunkService,
+		searchTargets:    searchTargets,
 	}
 }
 
 // Execute retrieves document information with concurrent processing
 func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
-	tenantID := uint64(0)
-	if tid, ok := ctx.Value(types.TenantIDContextKey).(uint64); ok {
-		tenantID = tid
-	}
-
 	// Parse args from json.RawMessage
 	var input GetDocumentInfoInput
 	if err := json.Unmarshal(args, &input); err != nil {
@@ -84,26 +102,19 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 		}, err
 	}
 
-	// Extract knowledge_ids array
 	knowledgeIDs := input.KnowledgeIDs
-	if len(knowledgeIDs) == 0 {
+	faqIDs := input.FAQIDs
+	if len(knowledgeIDs) == 0 && len(faqIDs) == 0 {
 		return &types.ToolResult{
 			Success: false,
-			Error:   "knowledge_ids is required and must be a non-empty array",
-		}, fmt.Errorf("knowledge_ids is required")
+			Error:   "knowledge_ids or faq_ids is required (non-empty array)",
+		}, fmt.Errorf("missing ids")
 	}
 
-	// Validate max 10 documents
-	if len(knowledgeIDs) > 10 {
-		return &types.ToolResult{
-			Success: false,
-			Error:   "knowledge_ids must contain at least one valid knowledge ID",
-		}, fmt.Errorf("no valid knowledge IDs provided")
-	}
-
-	// Concurrently get info for each knowledge ID
 	type docInfo struct {
 		knowledge  *types.Knowledge
+		chunk      *types.Chunk
+		faqMeta    *types.FAQChunkMetadata
 		chunkCount int
 		err        error
 	}
@@ -112,33 +123,97 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 	var mu sync.Mutex
 	results := make(map[string]*docInfo)
 
-	// Concurrently get info for each knowledge ID
+	for _, faqID := range faqIDs {
+		faqID = strings.TrimSpace(faqID)
+		if faqID == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			chunk, err := t.chunkService.GetChunkByIDOnly(ctx, id)
+			if err != nil || chunk == nil {
+				mu.Lock()
+				results["faq:"+id] = &docInfo{err: fmt.Errorf("faq entry not found: %v", err)}
+				mu.Unlock()
+				return
+			}
+			if !t.searchTargets.ContainsKB(chunk.KnowledgeBaseID) {
+				mu.Lock()
+				results["faq:"+id] = &docInfo{err: fmt.Errorf("knowledge base %s is not accessible", chunk.KnowledgeBaseID)}
+				mu.Unlock()
+				return
+			}
+			allowed, scopeErr := searchTargetsAllowKnowledgeID(ctx, t.searchTargets, chunk.KnowledgeID, chunk.KnowledgeBaseID, t.knowledgeService)
+			if scopeErr != nil || !allowed {
+				mu.Lock()
+				if scopeErr != nil {
+					results["faq:"+id] = &docInfo{err: fmt.Errorf("failed to validate FAQ scope: %v", scopeErr)}
+				} else {
+					results["faq:"+id] = &docInfo{err: fmt.Errorf("FAQ entry %s is not within the current @mention scope", id)}
+				}
+				mu.Unlock()
+				return
+			}
+			var meta *types.FAQChunkMetadata
+			if chunk.ChunkType == types.ChunkTypeFAQ {
+				meta, _ = chunk.FAQMetadata()
+			}
+			mu.Lock()
+			results["faq:"+id] = &docInfo{chunk: chunk, faqMeta: meta, chunkCount: 1}
+			mu.Unlock()
+		}(faqID)
+	}
+
 	for _, knowledgeID := range knowledgeIDs {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
 
-			// Get knowledge metadata
-			knowledge, err := t.knowledgeService.GetRepository().GetKnowledgeByID(ctx, tenantID, id)
+			// Get knowledge metadata without tenant filter to support shared KB
+			knowledge, err := t.knowledgeService.GetKnowledgeByIDOnly(ctx, id)
 			if err != nil {
 				mu.Lock()
 				results[id] = &docInfo{
-					err: fmt.Errorf("无法获取文档信息: %v", err),
+					err: fmt.Errorf("failed to get document info: %v", err),
 				}
 				mu.Unlock()
 				return
 			}
 
-			// Get chunk count
+			// Verify the knowledge's KB is in searchTargets (permission check)
+			if !t.searchTargets.ContainsKB(knowledge.KnowledgeBaseID) {
+				mu.Lock()
+				results[id] = &docInfo{
+					err: fmt.Errorf("knowledge base %s is not accessible", knowledge.KnowledgeBaseID),
+				}
+				mu.Unlock()
+				return
+			}
+			allowed, scopeErr := searchTargetsAllowKnowledgeID(ctx, t.searchTargets, knowledge.ID, knowledge.KnowledgeBaseID, t.knowledgeService)
+			if scopeErr != nil || !allowed {
+				mu.Lock()
+				if scopeErr != nil {
+					results[id] = &docInfo{err: fmt.Errorf("failed to validate document scope: %v", scopeErr)}
+				} else {
+					results[id] = &docInfo{err: fmt.Errorf("document %s is not within the current @mention scope", knowledge.ID)}
+				}
+				mu.Unlock()
+				return
+			}
+
+			// Use knowledge's actual tenant_id for chunk query (supports cross-tenant shared KB).
+			// Keep chunk-type filter aligned with list_knowledge_chunks so the
+			// "chunk_count" reported here matches what that tool can page over.
 			_, total, err := t.chunkService.GetRepository().
-				ListPagedChunksByKnowledgeID(ctx, tenantID, id, &types.Pagination{
+				ListPagedChunksByKnowledgeID(ctx, knowledge.TenantID, id, &types.Pagination{
 					Page:     1,
-					PageSize: 1000,
-				}, []types.ChunkType{"text"}, "", "", "", "", "")
+					PageSize: 1,
+				}, []types.ChunkType{types.ChunkTypeText, types.ChunkTypeFAQ}, "", "", "", "", "")
 			if err != nil {
 				mu.Lock()
 				results[id] = &docInfo{
-					err: fmt.Errorf("无法获取文档信息: %v", err),
+					err: fmt.Errorf("failed to get document info: %v", err),
 				}
 				mu.Unlock()
 				return
@@ -156,15 +231,35 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 
 	wg.Wait()
 
-	// Collect successful results and errors
+	requested := len(knowledgeIDs) + len(faqIDs)
 	successDocs := make([]*docInfo, 0)
 	var errors []string
 
 	for _, knowledgeID := range knowledgeIDs {
 		result := results[knowledgeID]
+		if result == nil {
+			errors = append(errors, fmt.Sprintf("%s: not found", knowledgeID))
+			continue
+		}
 		if result.err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", knowledgeID, result.err))
 		} else if result.knowledge != nil {
+			successDocs = append(successDocs, result)
+		}
+	}
+	for _, faqID := range faqIDs {
+		faqID = strings.TrimSpace(faqID)
+		if faqID == "" {
+			continue
+		}
+		result := results["faq:"+faqID]
+		if result == nil {
+			errors = append(errors, fmt.Sprintf("faq:%s: not found", faqID))
+			continue
+		}
+		if result.err != nil {
+			errors = append(errors, fmt.Sprintf("faq:%s: %v", faqID, result.err))
+		} else if result.chunk != nil {
 			successDocs = append(successDocs, result)
 		}
 	}
@@ -172,16 +267,15 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 	if len(successDocs) == 0 {
 		return &types.ToolResult{
 			Success: false,
-			Error:   fmt.Sprintf("无法获取任何文档信息。错误: %v", errors),
+			Error:   fmt.Sprintf("Failed to retrieve any document info. Errors: %v", errors),
 		}, fmt.Errorf("all document retrievals failed")
 	}
 
-	// Format output
-	output := "=== 文档信息 ===\n\n"
-	output += fmt.Sprintf("成功获取 %d / %d 个文档信息\n\n", len(successDocs), len(knowledgeIDs))
+	output := "=== Document Info ===\n\n"
+	output += fmt.Sprintf("Successfully retrieved %d / %d entries\n\n", len(successDocs), requested)
 
 	if len(errors) > 0 {
-		output += "=== 部分失败 ===\n"
+		output += "=== Partial Failures ===\n"
 		for _, errMsg := range errors {
 			output += fmt.Sprintf("  - %s\n", errMsg)
 		}
@@ -190,30 +284,36 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 
 	formattedDocs := make([]map[string]interface{}, 0, len(successDocs))
 	for i, doc := range successDocs {
-		k := doc.knowledge
+		output += fmt.Sprintf("[Entry #%d]\n", i+1)
 
-		output += fmt.Sprintf("【文档 #%d】\n", i+1)
-		output += fmt.Sprintf("  ID:       %s\n", k.ID)
-		output += fmt.Sprintf("  标题:     %s\n", k.Title)
+		if doc.chunk != nil {
+			formatted := formatFAQEntryInfo(&output, doc.chunk, doc.faqMeta)
+			formattedDocs = append(formattedDocs, formatted)
+			continue
+		}
+
+		k := doc.knowledge
+		output += fmt.Sprintf("  ID:           %s\n", k.ID)
+		output += fmt.Sprintf("  Title:        %s\n", k.Title)
 
 		if k.Description != "" {
-			output += fmt.Sprintf("  描述:     %s\n", k.Description)
+			output += fmt.Sprintf("  Description:  %s\n", k.Description)
 		}
 
-		output += fmt.Sprintf("  来源:     %s\n", formatSource(k.Type, k.Source))
+		output += fmt.Sprintf("  Source:       %s\n", formatSource(k.Type, k.Source))
 
 		if k.FileName != "" {
-			output += fmt.Sprintf("  文件名:   %s\n", k.FileName)
-			output += fmt.Sprintf("  文件类型: %s\n", k.FileType)
-			output += fmt.Sprintf("  文件大小: %s\n", formatFileSize(k.FileSize))
+			output += fmt.Sprintf("  File Name:    %s\n", k.FileName)
+			output += fmt.Sprintf("  File Type:    %s\n", k.FileType)
+			output += fmt.Sprintf("  File Size:    %s\n", formatFileSize(k.FileSize))
 		}
 
-		output += fmt.Sprintf("  处理状态: %s\n", formatParseStatus(k.ParseStatus))
-		output += fmt.Sprintf("  分块数量: %d 个\n", doc.chunkCount)
+		output += fmt.Sprintf("  Parse Status: %s\n", formatParseStatus(k.ParseStatus))
+		output += fmt.Sprintf("  Chunk Count:  %d\n", doc.chunkCount)
 
 		if k.Metadata != nil {
 			if metadata, err := k.Metadata.Map(); err == nil && len(metadata) > 0 {
-				output += "  元数据:\n"
+				output += "  Metadata:\n"
 				for key, value := range metadata {
 					output += fmt.Sprintf("    - %s: %v\n", key, value)
 				}
@@ -234,13 +334,15 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 			"parse_status": k.ParseStatus,
 			"chunk_count":  doc.chunkCount,
 			"metadata":     k.GetMetadata(),
+			"is_faq":       false,
 		})
 	}
 
-	// Extract first document title for summary
 	var firstTitle string
-	if len(successDocs) > 0 && successDocs[0].knowledge != nil {
-		firstTitle = successDocs[0].knowledge.Title
+	if len(formattedDocs) > 0 {
+		if t, ok := formattedDocs[0]["title"].(string); ok {
+			firstTitle = t
+		}
 	}
 
 	return &types.ToolResult{
@@ -249,22 +351,72 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 		Data: map[string]interface{}{
 			"documents":    formattedDocs,
 			"total_docs":   len(successDocs),
-			"requested":    len(knowledgeIDs),
+			"requested":    requested,
 			"errors":       errors,
 			"display_type": "document_info",
-			"title":        firstTitle, // For frontend summary display
+			"title":        firstTitle,
 		},
 	}, nil
+}
+
+func formatFAQEntryInfo(output *string, chunk *types.Chunk, meta *types.FAQChunkMetadata) map[string]interface{} {
+	title := faqStandardQuestion(chunk)
+	if title == "" && meta != nil {
+		title = strings.TrimSpace(meta.StandardQuestion)
+	}
+	if title == "" {
+		title = "FAQ Entry"
+	}
+
+	*output += fmt.Sprintf("  FAQ ID:       %s\n", chunk.ID)
+	*output += fmt.Sprintf("  Question:     %s\n", title)
+	if chunk.KnowledgeID != "" {
+		*output += fmt.Sprintf("  Container ID: %s\n", chunk.KnowledgeID)
+	}
+	if meta != nil && len(meta.Answers) > 0 {
+		*output += "  Answers:\n"
+		for _, ans := range meta.Answers {
+			*output += fmt.Sprintf("    - %s\n", ans)
+		}
+	}
+	if meta != nil && len(meta.SimilarQuestions) > 0 {
+		display, omitted := truncateSimilarQuestionsForDisplay(meta.SimilarQuestions)
+		*output += "  Similar Questions:\n"
+		for _, sq := range display {
+			*output += fmt.Sprintf("    - %s\n", sq)
+		}
+		if omitted > 0 {
+			*output += fmt.Sprintf("    ... and %d more omitted\n", omitted)
+		}
+	}
+	*output += "\n"
+
+	entry := map[string]interface{}{
+		"faq_id":       chunk.ID,
+		"knowledge_id": chunk.KnowledgeID,
+		"title":        title,
+		"faq_question": title,
+		"type":         "faq",
+		"is_faq":       true,
+		"chunk_count":  1,
+	}
+	if meta != nil {
+		if len(meta.Answers) > 0 {
+			entry["faq_answers"] = meta.Answers
+		}
+		appendSimilarQuestionsToChunkData(entry, meta.SimilarQuestions)
+	}
+	return entry
 }
 
 func formatSource(knowledgeType, source string) string {
 	switch knowledgeType {
 	case "file":
-		return "文件上传"
+		return "File Upload"
 	case "url":
 		return fmt.Sprintf("URL: %s", source)
 	case "passage":
-		return "文本输入"
+		return "Text Input"
 	default:
 		return knowledgeType
 	}
@@ -272,7 +424,7 @@ func formatSource(knowledgeType, source string) string {
 
 func formatFileSize(size int64) string {
 	if size == 0 {
-		return "未知"
+		return "Unknown"
 	}
 	const unit = 1024
 	if size < unit {
@@ -289,13 +441,13 @@ func formatFileSize(size int64) string {
 func formatParseStatus(status string) string {
 	switch status {
 	case "pending":
-		return "⏳ 待处理"
+		return "Pending"
 	case "processing":
-		return "🔄 处理中"
+		return "Processing"
 	case "completed", "success":
-		return "✅ 已完成"
+		return "Completed"
 	case "failed":
-		return "❌ 失败"
+		return "Failed"
 	default:
 		return status
 	}

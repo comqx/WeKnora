@@ -10,6 +10,7 @@ This module provides comprehensive Markdown parsing functionality including:
 The parser uses a pipeline approach to process Markdown content through
 multiple stages: table formatting -> image processing.
 """
+
 import base64
 import logging
 import os
@@ -25,26 +26,28 @@ from docreader.utils import endecode
 # Get logger object
 logger = logging.getLogger(__name__)
 
+_SEPARATOR_CELL = re.compile(r"^:?-{3,}:?$")
+
 
 class MarkdownTableUtil:
     """Utility class for formatting Markdown tables.
-    
+
     This class standardizes Markdown table formatting by:
     - Normalizing column alignment markers (e.g., :---, :---:, ---:)
     - Adding consistent spacing around pipes (|)
     - Preserving indentation levels
     - Handling both header rows and data rows
-    
+
     Example:
         Input:  |姓名|年龄|城市|
                 |:---|---:|:---:|
                 |张三|25|北京|
-        
+
         Output: | 姓名 | 年龄 | 城市 |
                 | :--- | ---: | :---: |
                 | 张三 | 25 | 北京 |
     """
-    
+
     def __init__(self):
         # Pattern to match alignment row (e.g., |:---|---:|:---:|)
         self.align_pattern = re.compile(
@@ -57,20 +60,84 @@ class MarkdownTableUtil:
             re.MULTILINE,
         )
 
+    @staticmethod
+    def _split_row_cells(row_line: str) -> List[str]:
+        """Split a markdown table row into cells, preserving empty cells."""
+        inner = row_line.strip()
+        if not inner.startswith("|"):
+            return []
+        parts = inner.split("|")
+        if parts and parts[0].strip() == "":
+            parts = parts[1:]
+        if parts and parts[-1].strip() == "":
+            parts = parts[:-1]
+        return [part.strip() for part in parts]
+
+    @staticmethod
+    def _is_table_row(line: str) -> bool:
+        stripped = line.strip()
+        return stripped.startswith("|") and "|" in stripped[1:]
+
+    @classmethod
+    def _is_separator_row(cls, line: str) -> bool:
+        cells = cls._split_row_cells(line)
+        return bool(cells) and all(_SEPARATOR_CELL.match(cell) for cell in cells)
+
+    @classmethod
+    def _is_empty_row(cls, line: str) -> bool:
+        cells = cls._split_row_cells(line)
+        return bool(cells) and all(cell == "" for cell in cells)
+
+    @classmethod
+    def _separator_row_for(cls, header_line: str) -> str:
+        cells = cls._split_row_cells(header_line)
+        return "| " + " | ".join("---" for _ in cells) + " |"
+
+    @classmethod
+    def _normalize_table_block(cls, block: List[str]) -> List[str]:
+        """Fix MarkItDown-style tables: drop bogus prefix rows, ensure GFM delimiter."""
+        while block and cls._is_empty_row(block[0]):
+            block.pop(0)
+        if block and cls._is_separator_row(block[0]):
+            block.pop(0)
+        # GFM/marked need "| --- |" after the first row. Headerless Word tables
+        # only have data rows after we strip the fake empty+separator prefix.
+        if len(block) >= 2 and not cls._is_separator_row(block[1]):
+            sep = cls._separator_row_for(block[0])
+            block = [block[0], sep] + block[1:]
+        return block
+
+    def normalize_spurious_table_prefixes(self, content: str) -> str:
+        """Remove bogus empty/separator prefix rows from MarkItDown table output."""
+        lines = content.split("\n")
+        out: List[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if not self._is_table_row(line):
+                out.append(line)
+                i += 1
+                continue
+            block: List[str] = []
+            while i < len(lines) and self._is_table_row(lines[i]):
+                block.append(lines[i])
+                i += 1
+            out.extend(self._normalize_table_block(block))
+        return "\n".join(out)
+
     def format_table(self, content: str) -> str:
         """Format all Markdown tables in the content.
-        
+
         Args:
             content: Raw Markdown text containing tables
-            
+
         Returns:
             Formatted Markdown text with standardized table formatting
         """
-        
+
         def process_align(match: Match[str]) -> str:
             """Process alignment row to standardize format."""
-            # Split by | and remove empty strings
-            columns = [col.strip() for col in match.group(0).split("|") if col.strip()]
+            columns = self._split_row_cells(match.group(0))
 
             processed = []
             for col in columns:
@@ -86,8 +153,7 @@ class MarkdownTableUtil:
 
         def process_line(match: Match[str]) -> str:
             """Process regular table row to standardize format."""
-            # Split by | and remove empty strings
-            columns = [col.strip() for col in match.group(0).split("|") if col.strip()]
+            columns = self._split_row_cells(match.group(0))
 
             # Preserve original indentation
             prefix = match.group(1)
@@ -98,8 +164,7 @@ class MarkdownTableUtil:
         formatted_content = self.line_pattern.sub(process_line, formatted_content)
         # Then format alignment rows (must be done after to avoid conflicts)
         formatted_content = self.align_pattern.sub(process_align, formatted_content)
-
-        return formatted_content
+        return self.normalize_spurious_table_prefixes(formatted_content)
 
     @staticmethod
     def _self_test():
@@ -125,10 +190,10 @@ class MarkdownTableUtil:
 
 class MarkdownTableFormatter(BaseParser):
     """Parser for formatting Markdown tables.
-    
+
     This parser standardizes the formatting of all Markdown tables in the
     document to ensure consistent spacing and alignment markers.
-    
+
     Example:
         >>> formatter = MarkdownTableFormatter()
         >>> content = b"|Name|Age|\n|---|---|\n|John|30|"
@@ -138,17 +203,17 @@ class MarkdownTableFormatter(BaseParser):
         | --- | --- |
         | John | 30 |
     """
-    
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.table_helper = MarkdownTableUtil()
 
     def parse_into_text(self, content: bytes) -> Document:
         """Parse and format Markdown tables.
-        
+
         Args:
             content: Raw Markdown content as bytes
-            
+
         Returns:
             Document with formatted table content
         """
@@ -161,28 +226,30 @@ class MarkdownTableFormatter(BaseParser):
 
 class MarkdownImageUtil:
     """Utility class for handling images in Markdown.
-    
+
     This class provides functionality to:
     - Extract base64-encoded images from Markdown
     - Extract image paths from Markdown
     - Replace image paths with new URLs
     - Convert base64 images to binary format
-    
+
     Supported formats:
     - Base64 embedded images: ![alt](data:image/png;base64,iVBORw0...)
     - Regular image links: ![alt](path/to/image.png)
     """
-    
+
     def __init__(self):
         # Pattern to match base64 embedded images
         # Captures: (1) alt text, (2) image format, (3) base64 data
+        # Alt text uses .*? (non-greedy) to allow literal ] (e.g. Windows paths).
+        # MIME subtype uses [^;]+ to handle types with hyphens like x-emf.
         self.b64_pattern = re.compile(
-            r"!\[([^\]]*)\]\(data:image/(\w+)\+?\w*;base64,([^\)]+)\)"
+            r"!\[(.*?)\]\(data:image/([^;]+);base64,([^\)]+)\)"
         )
-        # Pattern to match regular image syntax
-        self.image_pattern = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+        # Pattern to match regular image syntax (alt text allows ])
+        self.image_pattern = re.compile(r"!\[(.*?)\]\(([^)]+)\)")
         # Pattern for replacing image paths
-        self.replace_pattern = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+        self.replace_pattern = re.compile(r"!\[(.*?)\]\(([^)]+)\)")
 
     def extract_image(
         self,
@@ -191,15 +258,15 @@ class MarkdownImageUtil:
         replace: bool = True,
     ) -> Tuple[str, List[str]]:
         """Extract image paths from Markdown content.
-        
+
         Args:
             content: Markdown text containing images
             path_prefix: Optional prefix to add to image paths
             replace: Whether to replace image syntax in content
-            
+
         Returns:
             Tuple of (processed_text, list_of_image_paths)
-            
+
         Example:
             >>> util = MarkdownImageUtil()
             >>> text, images = util.extract_image("![logo](img/logo.png)")
@@ -213,7 +280,7 @@ class MarkdownImageUtil:
             """Replacement function for each image match."""
             title = match.group(1)  # Alt text
             image_path = match.group(2)  # Image path
-            
+
             # Add prefix if specified
             if path_prefix:
                 image_path = f"{path_prefix}/{image_path}"
@@ -238,19 +305,19 @@ class MarkdownImageUtil:
         replace: bool = True,
     ) -> Tuple[str, Dict[str, bytes]]:
         """Extract and decode base64 embedded images from Markdown.
-        
+
         This method finds all base64-encoded images in the Markdown content,
         decodes them to binary format, generates unique filenames, and
         optionally replaces them with file path references.
-        
+
         Args:
             content: Markdown text containing base64 images
             path_prefix: Optional directory prefix for generated paths
             replace: Whether to replace base64 syntax with file paths
-            
+
         Returns:
             Tuple of (processed_text, dict_of_path_to_bytes)
-            
+
         Example:
             >>> util = MarkdownImageUtil()
             >>> text = "![logo](data:image/png;base64,iVBORw0KGg...)"
@@ -294,17 +361,17 @@ class MarkdownImageUtil:
 
     def replace_path(self, content: str, images: Dict[str, str]) -> str:
         """Replace image paths in Markdown with new URLs.
-        
+
         This method is typically used to replace local file paths with
         uploaded URLs after images have been stored.
-        
+
         Args:
             content: Markdown text with image references
             images: Mapping of old paths to new URLs
-            
+
         Returns:
             Markdown text with updated image URLs
-            
+
         Example:
             >>> util = MarkdownImageUtil()
             >>> content = "![logo](temp/img.png)"
@@ -320,7 +387,7 @@ class MarkdownImageUtil:
             """Replacement function for each image match."""
             title = match.group(1)  # Alt text
             image_path = match.group(2)  # Current image path
-            
+
             # Only replace if path exists in mapping
             if image_path not in images:
                 return match.group(0)  # Keep original
@@ -328,7 +395,7 @@ class MarkdownImageUtil:
             content_replace.add(image_path)
             # Get new URL from mapping
             image_path = images[image_path]
-            return f"![{title}]({image_path})"
+            return f"![{title}]({image_path})" if image_path else title
 
         text = self.replace_pattern.sub(repl, content)
         logger.debug(f"Replaced {len(content_replace)} images in markdown")
@@ -347,78 +414,40 @@ class MarkdownImageUtil:
 
 
 class MarkdownImageBase64(BaseParser):
-    """Parser for extracting and uploading base64 images from Markdown.
-    
-    This parser:
-    1. Extracts base64-encoded images from Markdown content
-    2. Uploads the decoded images to storage
-    3. Replaces base64 data with uploaded URLs
-    4. Returns a Document with clean Markdown and image mappings
-    
-    Requires:
-        - self.storage: Storage backend for uploading images
-        
-    Example:
-        >>> parser = MarkdownImageBase64(storage=my_storage)
-        >>> content = b"![logo](data:image/png;base64,iVBORw0...)"
-        >>> doc = parser.parse_into_text(content)
-        >>> print(doc.content)
-        ![logo](https://storage.com/uuid.png)
+    """Parser for extracting base64 images from Markdown.
+
+    Extracts base64-encoded images, replaces them with path references,
+    and returns the raw image data in Document.images for the Go-side
+    ImageResolver (or main.py _resolve_images) to handle storage.
     """
-    
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.image_helper = MarkdownImageUtil()
 
     def parse_into_text(self, content: bytes) -> Document:
-        """Parse Markdown and process base64 images.
-        
-        Args:
-            content: Raw Markdown content as bytes
-            
-        Returns:
-            Document with:
-                - content: Markdown with base64 replaced by URLs
-                - images: Dict mapping URLs to base64 strings
-        """
-        # Convert byte content to string using universal decoding method
         text = endecode.decode_bytes(content)
-        # Extract base64 images and replace with temporary paths
         text, img_b64 = self.image_helper.extract_base64(text, path_prefix="images")
 
-        # Final image mapping: URL -> base64 string (for Document)
         images: Dict[str, str] = {}
-        # Temporary mapping: temp_path -> uploaded_URL (for replacement)
-        image_replace: Dict[str, str] = {}
+        for ipath, raw_bytes in img_b64.items():
+            images[ipath] = base64.b64encode(raw_bytes).decode()
 
-        logger.debug(f"Uploading {len(img_b64)} images from markdown")
-        # Upload each extracted image to storage
-        for ipath, b64_bytes in img_b64.items():
-            # Get file extension for proper MIME type
-            ext = os.path.splitext(ipath)[1].lower()
-            # Upload binary data and get back URL
-            image_url = self.storage.upload_bytes(b64_bytes, ext)
-
-            # Map temp path to uploaded URL for replacement
-            image_replace[ipath] = image_url
-            # Store base64 string in final images dict
-            images[image_url] = base64.b64encode(b64_bytes).decode()
-
-        # Replace temporary paths with actual uploaded URLs
-        text = self.image_helper.replace_path(text, image_replace)
+        logger.debug("Extracted %d base64 images from markdown", len(images))
         return Document(content=text, images=images)
 
 
 class MarkdownParser(PipelineParser):
     """Complete Markdown parser using pipeline approach.
-    
+
     This parser processes Markdown content through multiple stages:
     1. MarkdownTableFormatter: Standardizes table formatting
     2. MarkdownImageBase64: Extracts and uploads base64 images
-    
+
     The pipeline ensures that content flows through each parser in sequence,
     with each stage's output becoming the next stage's input.
     """
+
     _parser_cls = (MarkdownTableFormatter, MarkdownImageBase64)
 
 

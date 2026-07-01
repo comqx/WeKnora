@@ -23,7 +23,7 @@
 ```go
 import (
     "context"
-    "github.com/Tencent/WeKnora/internal/client"
+    "github.com/Tencent/WeKnora/client"
     "time"
 )
 
@@ -33,6 +33,26 @@ apiClient := client.NewClient(
     client.WithToken("your-auth-token"),
     client.WithTimeout(30*time.Second),
 )
+```
+
+### 租户配置
+
+客户端支持通过 `WithTenantID` 设置默认租户，请求时会自动携带 `X-Tenant-ID` 请求头：
+
+```go
+tenantID := uint64(10000)
+apiClient := client.NewClient(
+    "http://api.example.com",
+    client.WithToken("your-auth-token"),
+    client.WithTenantID(tenantID),
+)
+```
+
+如果某个请求需要临时切换租户，可以在 `context` 中设置 `TenantID`，值可以是 `uint64`、`*uint64` 或字符串形式的数字，客户端会优先使用该值：
+
+```go
+ctx := context.WithValue(context.Background(), "TenantID", uint64(10000))
+// 调用任意客户端方法时传入 ctx，即可切换到租户 10000
 ```
 
 ### 示例：创建知识库并上传文件
@@ -279,6 +299,73 @@ updateRequest := &client.UpdateChunkRequest{
 updatedChunk, err := apiClient.UpdateChunk(context.Background(), knowledgeID, chunkID, updateRequest)
 if err != nil {
     // 处理错误
+}
+```
+
+### 示例：重新解析知识
+
+```go
+// 重新解析知识（删除现有内容并重新解析）
+// 适用场景：
+// 1. 原始解析失败，需要重试
+// 2. 更新了解析配置（如分块策略、多模态设置等），需要重新解析
+// 3. 知识内容已更新，需要刷新解析结果
+
+knowledge, err := apiClient.ReparseKnowledge(context.Background(), knowledgeID)
+if err != nil {
+    // 处理错误
+}
+
+// 知识将进入 "pending" 状态，异步重新解析
+fmt.Printf("Knowledge ID: %s\n", knowledge.ID)
+fmt.Printf("Parse Status: %s\n", knowledge.ParseStatus)      // "pending"
+fmt.Printf("Enable Status: %s\n", knowledge.EnableStatus)    // "disabled"
+
+// 可以轮询检查解析状态
+for {
+    time.Sleep(5 * time.Second)
+    knowledge, err := apiClient.GetKnowledge(context.Background(), knowledgeID)
+    if err != nil {
+        // 处理错误
+    }
+    
+    if knowledge.ParseStatus == "completed" {
+        fmt.Println("Knowledge re-parsing completed!")
+        break
+    } else if knowledge.ParseStatus == "failed" {
+        fmt.Printf("Knowledge re-parsing failed: %s\n", knowledge.ErrorMessage)
+        break
+    }
+}
+```
+
+### 示例：取消解析
+
+```go
+// 取消正在进行的解析任务（资源紧张 / 上传错误文件时使用）
+// - 已经 completed / failed 的知识不能取消
+// - 已写入的分块/索引会保留，可后续调用 ReparseKnowledge 重新解析
+
+knowledge, err := apiClient.CancelKnowledgeParse(context.Background(), knowledgeID)
+if err != nil {
+    // 处理错误
+}
+fmt.Printf("Parse Status: %s\n", knowledge.ParseStatus) // "cancelled"
+```
+
+### 示例：查看文档解析追踪（Span 树）
+
+```go
+// 获取文档解析流水线的 Span 树（root → stage → subspan）
+// - attempt 传 0 表示获取最新一次解析尝试
+// - 始终返回 5 个标准阶段：docreader / chunking / embedding / multimodal / postprocess
+trace, err := apiClient.GetKnowledgeProcessingSpans(context.Background(), knowledgeID, 0)
+if err != nil {
+    // 处理错误
+}
+fmt.Printf("ParseStatus=%s CurrentStage=%s\n", trace.ParseStatus, trace.CurrentStage)
+for _, stage := range trace.Trace.Children {
+    fmt.Printf("- %s: %s (%dms)\n", stage.Name, stage.Status, stage.DurationMs)
 }
 ```
 

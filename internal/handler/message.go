@@ -1,14 +1,17 @@
 package handler
 
 import (
+	stderrors "errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
@@ -69,6 +72,15 @@ func (h *MessageHandler) LoadMessages(c *gin.Context) {
 		logger.Infof(ctx, "Getting recent messages for session, session ID: %s, limit: %d", sessionID, limitInt)
 		messages, err := h.MessageService.GetRecentMessagesBySession(ctx, sessionID, limitInt)
 		if err != nil {
+			if stderrors.Is(err, errors.ErrSessionNotFound) {
+				// PR #1309 plumbed user-scope into the message service's
+				// session existence check; non-owner / wrong-tenant lookups
+				// surface as ErrSessionNotFound. Map to 404 so clients can
+				// tell "wrong URL" from a real 5xx.
+				logger.Warnf(ctx, "Session not found, ID: %s", sessionID)
+				c.Error(errors.NewNotFoundError(err.Error()))
+				return
+			}
 			logger.ErrorWithFields(ctx, err, nil)
 			c.Error(errors.NewInternalServerError(err.Error()))
 			return
@@ -86,15 +98,15 @@ func (h *MessageHandler) LoadMessages(c *gin.Context) {
 		return
 	}
 
-	// If beforeTime is provided, parse the timestamp
-	beforeTime, err := time.Parse(time.RFC3339Nano, beforeTimeStr)
+	// If beforeTime is provided, parse the timestamp (RFC3339Nano or RFC3339).
+	beforeTime, err := parseMessageBeforeTime(beforeTimeStr)
 	if err != nil {
 		logger.Errorf(
 			ctx,
-			"Invalid time format, please use RFC3339Nano format, err: %v, beforeTimeStr: %s",
+			"Invalid time format, please use RFC3339/RFC3339Nano format, err: %v, beforeTimeStr: %s",
 			err, beforeTimeStr,
 		)
-		c.Error(errors.NewBadRequestError("Invalid time format, please use RFC3339Nano format"))
+		c.Error(errors.NewBadRequestError("Invalid time format, please use RFC3339 or RFC3339Nano format"))
 		return
 	}
 
@@ -103,6 +115,12 @@ func (h *MessageHandler) LoadMessages(c *gin.Context) {
 		sessionID, beforeTime.Format(time.RFC3339Nano), limitInt)
 	messages, err := h.MessageService.GetMessagesBySessionBeforeTime(ctx, sessionID, beforeTime, limitInt)
 	if err != nil {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
+			// See note on the GetRecentMessagesBySession path above.
+			logger.Warnf(ctx, "Session not found, ID: %s", sessionID)
+			c.Error(errors.NewNotFoundError(err.Error()))
+			return
+		}
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
@@ -145,6 +163,14 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 
 	// Delete the message using the message service
 	if err := h.MessageService.DeleteMessage(ctx, sessionID, messageID); err != nil {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
+			// See note on LoadMessages above — message-service operations
+			// surface ErrSessionNotFound when the caller can't see the
+			// owning session (post-#1309 user scope).
+			logger.Warnf(ctx, "Session not found, ID: %s", sessionID)
+			c.Error(errors.NewNotFoundError(err.Error()))
+			return
+		}
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
@@ -155,4 +181,117 @@ func (h *MessageHandler) DeleteMessage(c *gin.Context) {
 		"success": true,
 		"message": "Message deleted successfully",
 	})
+}
+
+// SearchMessages godoc
+// @Summary      搜索历史对话
+// @Description  通过关键词和/或向量相似度搜索历史对话记录，支持关键词、向量、混合三种模式
+// @Tags         消息
+// @Accept       json
+// @Produce      json
+// @Param        request  body      SearchMessagesRequest  true  "搜索请求"
+// @Success      200      {object}  map[string]interface{}  "搜索结果"
+// @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /messages/search [post]
+func (h *MessageHandler) SearchMessages(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	logger.Info(ctx, "Start searching messages")
+
+	var request SearchMessagesRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		logger.Error(ctx, "Failed to parse search request", err)
+		c.Error(errors.NewBadRequestError(err.Error()))
+		return
+	}
+
+	if request.Query == "" {
+		logger.Error(ctx, "Query content is empty")
+		c.Error(errors.NewBadRequestError("Query content cannot be empty"))
+		return
+	}
+
+	params := &types.MessageSearchParams{
+		Query:      secutils.SanitizeForLog(request.Query),
+		Mode:       types.MessageSearchMode(request.Mode),
+		Limit:      request.Limit,
+		SessionIDs: request.SessionIDs,
+	}
+
+	logger.Infof(ctx, "Searching messages with params: query=%s, mode=%s, limit=%d, session_ids=%v",
+		params.Query, params.Mode, params.Limit, params.SessionIDs)
+
+	result, err := h.MessageService.SearchMessages(ctx, params)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	logger.Infof(ctx, "Message search completed, found %d results", result.Total)
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    result,
+	})
+}
+
+// SearchMessagesRequest defines the request structure for searching messages
+type SearchMessagesRequest struct {
+	// Query text for search
+	Query string `json:"query" binding:"required"`
+	// Search mode: "keyword", "vector", "hybrid" (default: "hybrid")
+	Mode string `json:"mode"`
+	// Maximum number of results to return (default: 20)
+	Limit int `json:"limit"`
+	// Filter by specific session IDs (optional)
+	SessionIDs []string `json:"session_ids"`
+}
+
+// GetChatHistoryKBStats godoc
+// @Summary      获取聊天历史知识库统计
+// @Description  获取聊天历史知识库的统计信息（已索引消息数、知识库大小等）
+// @Tags         消息
+// @Accept       json
+// @Produce      json
+// @Success      200  {object}  map[string]interface{}  "统计信息"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /messages/chat-history-stats [get]
+func (h *MessageHandler) GetChatHistoryKBStats(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	logger.Info(ctx, "Getting chat history KB stats")
+
+	stats, err := h.MessageService.GetChatHistoryKBStats(ctx)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    stats,
+	})
+}
+
+// parseMessageBeforeTime parses the `before_time` query used by LoadMessages.
+// Frontend cursors may be RFC3339 (no fractional seconds) or RFC3339Nano.
+func parseMessageBeforeTime(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, stderrors.New("empty before_time")
+	}
+	layouts := []string{time.RFC3339Nano, time.RFC3339}
+	var lastErr error
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return time.Time{}, lastErr
 }

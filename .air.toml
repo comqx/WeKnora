@@ -5,9 +5,9 @@ tmp_dir = "tmp"
 [build]
   args_bin = []
   bin = "./tmp/main"
-  cmd = "go build -o ./tmp/main ./cmd/server"
+  cmd = "go build -ldflags=\"$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'\" -o ./tmp/main ./cmd/server"
   delay = 1000
-  exclude_dir = ["assets", "tmp", "vendor", "testdata", "frontend", "migrations", "node_modules", "docs"]
+  exclude_dir = ["assets", "tmp", "vendor", "testdata", "frontend", "migrations", "node_modules", "docs", "logs", "data", "WeKnora-Chrome-Extension", "Formula", "dataset", "docreader", "docker", "llm_debug", "web", "mcp-server", "misc", "scripts", "dist", "client", "helm"]
   exclude_file = []
   exclude_regex = ["_test.go"]
   exclude_unchanged = false
@@ -17,7 +17,7 @@ tmp_dir = "tmp"
   include_dir = []
   include_ext = ["go", "tpl", "tmpl", "html", "yaml"]
   include_file = []
-  kill_delay = "0s"
+  kill_delay = "2s"
   log = "build-errors.log"
   poll = false
   poll_interval = 0
@@ -38,7 +38,7 @@ tmp_dir = "tmp"
   time = false
 
 [misc]
-  clean_on_exit = false
+  clean_on_exit = true
 
 [screen]
   clear_on_rebuild = false

@@ -22,6 +22,10 @@ const (
 	BuiltinKnowledgeGraphExpertID = "builtin-knowledge-graph-expert"
 	// BuiltinDocumentAssistantID is the ID for the built-in document assistant agent
 	BuiltinDocumentAssistantID = "builtin-document-assistant"
+	// BuiltinWikiResearcherID is the ID for the built-in wiki researcher agent
+	BuiltinWikiResearcherID = "builtin-wiki-researcher"
+	// BuiltinWikiFixerID is the ID for the built-in wiki fixer agent
+	BuiltinWikiFixerID = "builtin-wiki-fixer"
 )
 
 // AgentMode constants for agent running mode
@@ -30,6 +34,27 @@ const (
 	AgentModeQuickAnswer = "quick-answer"
 	// AgentModeSmartReasoning is the ReAct mode for multi-step reasoning
 	AgentModeSmartReasoning = "smart-reasoning"
+)
+
+// AgentType constants for Smart-Reasoning agent presets.
+// These presets bundle a recommended system prompt template,
+// tool allowlist, KB compatibility hint, and other defaults so users
+// don't have to configure everything from scratch.
+// AgentTypeCustom means the user wants full control and we won't
+// auto-fill anything based on the preset.
+const (
+	// AgentTypeRAGQA prefers vector/keyword chunk retrieval on document KBs.
+	AgentTypeRAGQA = "rag-qa"
+	// AgentTypeWikiQA prefers wiki-page navigation on wiki-enabled KBs.
+	AgentTypeWikiQA = "wiki-qa"
+	// AgentTypeHybridRAGWiki orchestrates Wiki + RAG on KBs where both are enabled.
+	AgentTypeHybridRAGWiki = "hybrid-rag-wiki"
+	// AgentTypeDataAnalysis runs SQL / statistics over tabular files (CSV, Excel)
+	// uploaded into the KB. Retrieval semantics (vector/wiki/…) are largely
+	// irrelevant — this type is about data_schema + data_analysis tools.
+	AgentTypeDataAnalysis = "data-analysis"
+	// AgentTypeCustom is the "no preset" option; user-configured end to end.
+	AgentTypeCustom = "custom"
 )
 
 // CustomAgent represents a configurable AI agent (similar to GPTs)
@@ -58,6 +83,11 @@ type CustomAgent struct {
 	CreatedAt time.Time      `yaml:"created_at" json:"created_at"`
 	UpdatedAt time.Time      `yaml:"updated_at" json:"updated_at"`
 	DeletedAt gorm.DeletedAt `yaml:"deleted_at" json:"deleted_at" gorm:"index"`
+
+	// CreatorName 由 list handler 在返回前批量回填，作用同 KnowledgeBase.CreatorName：
+	// 让前端列表卡片区分「我创建」与「同租户其他成员创建」。不落库，内建 agent / 老数据
+	// 仍可能为空。
+	CreatorName string `yaml:"-" json:"creator_name,omitempty" gorm:"-"`
 }
 
 // CustomAgentConfig represents the configuration of a custom agent
@@ -65,10 +95,22 @@ type CustomAgentConfig struct {
 	// ===== Basic Settings =====
 	// Agent mode: "quick-answer" for RAG mode, "smart-reasoning" for ReAct agent mode
 	AgentMode string `yaml:"agent_mode" json:"agent_mode"`
-	// System prompt for the agent (unified prompt, uses {{web_search_status}} placeholder for dynamic behavior)
+	// AgentType is a preset category under smart-reasoning mode that pre-fills
+	// system prompt, allowed tools and recommended KB compatibility.
+	// Valid values: "rag-qa", "wiki-qa", "hybrid-rag-wiki", "custom".
+	// Empty / unknown values are treated as "custom" (no preset applied).
+	// Ignored for quick-answer mode.
+	AgentType string `yaml:"agent_type" json:"agent_type,omitempty"`
+	// System prompt for the agent (unified prompt, uses web_search_status placeholder for dynamic behavior)
 	SystemPrompt string `yaml:"system_prompt" json:"system_prompt"`
+	// SystemPromptID references a template ID in prompt_templates/ YAML files.
+	// If set and SystemPrompt is empty, the template content will be resolved at startup.
+	SystemPromptID string `yaml:"system_prompt_id" json:"system_prompt_id,omitempty"`
 	// Context template for normal mode (how to format retrieved chunks)
 	ContextTemplate string `yaml:"context_template" json:"context_template"`
+	// ContextTemplateID references a template ID in prompt_templates/ YAML files.
+	// If set and ContextTemplate is empty, the template content will be resolved at startup.
+	ContextTemplateID string `yaml:"context_template_id" json:"context_template_id,omitempty"`
 
 	// ===== Model Settings =====
 	// Model ID to use for conversations
@@ -79,30 +121,64 @@ type CustomAgentConfig struct {
 	Temperature float64 `yaml:"temperature" json:"temperature"`
 	// Maximum completion tokens (only for normal mode)
 	MaxCompletionTokens int `yaml:"max_completion_tokens" json:"max_completion_tokens"`
+	// Whether to enable thinking mode (for models that support extended thinking)
+	Thinking *bool `yaml:"thinking" json:"thinking"`
 
 	// ===== Agent Mode Settings =====
 	// Maximum iterations for ReAct loop (only for agent type)
 	MaxIterations int `yaml:"max_iterations" json:"max_iterations"`
+	// Timeout for a single LLM call in seconds (0 = use global default)
+	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout,omitempty"`
 	// Allowed tools (only for agent type)
 	AllowedTools []string `yaml:"allowed_tools" json:"allowed_tools"`
-	// Whether reflection is enabled (only for agent type)
-	ReflectionEnabled bool `yaml:"reflection_enabled" json:"reflection_enabled"`
 	// MCP service selection mode: "all" = all enabled MCP services, "selected" = specific services, "none" = no MCP
 	MCPSelectionMode string `yaml:"mcp_selection_mode" json:"mcp_selection_mode"`
 	// Selected MCP service IDs (only used when MCPSelectionMode is "selected")
 	MCPServices []string `yaml:"mcp_services" json:"mcp_services"`
 
+	// ===== Skills Settings (only for smart-reasoning mode) =====
+	// Skills selection mode: "all" = all preloaded skills, "selected" = specific skills, "none" = no skills
+	SkillsSelectionMode string `yaml:"skills_selection_mode" json:"skills_selection_mode"`
+	// Selected skill names (only used when SkillsSelectionMode is "selected")
+	SelectedSkills []string `yaml:"selected_skills" json:"selected_skills"`
 	// ===== Knowledge Base Settings =====
 	// Knowledge base selection mode: "all" = all KBs, "selected" = specific KBs, "none" = no KB
 	KBSelectionMode string `yaml:"kb_selection_mode" json:"kb_selection_mode"`
 	// Associated knowledge base IDs (only used when KBSelectionMode is "selected")
 	KnowledgeBases []string `yaml:"knowledge_bases" json:"knowledge_bases"`
+	// Whether to retrieve knowledge base only when explicitly mentioned with @ (default: false)
+	// When true, knowledge base retrieval only happens if user explicitly mentions KB/files with @
+	// When false, knowledge base retrieval happens according to KBSelectionMode
+	RetrieveKBOnlyWhenMentioned bool `yaml:"retrieve_kb_only_when_mentioned" json:"retrieve_kb_only_when_mentioned"`
+
+	// Whether to retain retrieval history across turns
+	RetainRetrievalHistory bool `yaml:"retain_retrieval_history" json:"retain_retrieval_history"`
+
+	// ===== Image Upload / Multimodal Settings =====
+	// Whether image upload is enabled for this agent (default: false)
+	ImageUploadEnabled bool `yaml:"image_upload_enabled" json:"image_upload_enabled"`
+	// VLM model ID for image analysis (optional, falls back to tenant-level VLM)
+	VLMModelID string `yaml:"vlm_model_id" json:"vlm_model_id"`
+	// Whether audio upload (ASR transcription) is enabled for this agent (default: false)
+	AudioUploadEnabled bool `yaml:"audio_upload_enabled" json:"audio_upload_enabled"`
+	// ASR model ID for audio transcription (optional)
+	ASRModelID string `yaml:"asr_model_id" json:"asr_model_id"`
+	// Storage provider for image uploads: "local", "minio", "cos", "tos", "s3", "oss", "ks3".
+	// Empty means use the global/tenant default provider.
+	ImageStorageProvider string `yaml:"image_storage_provider" json:"image_storage_provider"`
 
 	// ===== File Type Restriction Settings =====
 	// Supported file types for this agent (e.g., ["csv", "xlsx", "xls"])
 	// Empty means all file types are supported
 	// When set, only files with matching extensions can be used with this agent
 	SupportedFileTypes []string `yaml:"supported_file_types" json:"supported_file_types"`
+
+	// ===== Data Analysis Settings =====
+	// Whether to run the legacy in-pipeline DuckDB SQL data-analysis stage when
+	// the retrieved chunks include CSV/Excel files. This issues an extra LLM
+	// call to generate a SQL query and is disabled by default because most
+	// quick-answer / RAG-style agents do not want the added latency.
+	DataAnalysisEnabled bool `yaml:"data_analysis_enabled" json:"data_analysis_enabled"`
 
 	// ===== FAQ Strategy Settings =====
 	// Whether FAQ priority strategy is enabled (FAQ answers prioritized over document chunks)
@@ -117,6 +193,13 @@ type CustomAgentConfig struct {
 	WebSearchEnabled bool `yaml:"web_search_enabled" json:"web_search_enabled"`
 	// Maximum web search results
 	WebSearchMaxResults int `yaml:"web_search_max_results" json:"web_search_max_results"`
+	// WebSearchProviderID references a specific WebSearchProviderEntity.
+	// If empty, the tenant's default provider (is_default=true) is used.
+	WebSearchProviderID string `yaml:"web_search_provider_id" json:"web_search_provider_id,omitempty"`
+	// Whether to auto-fetch full page content for reranked web search results
+	WebFetchEnabled bool `yaml:"web_fetch_enabled" json:"web_fetch_enabled"`
+	// Max number of pages to fetch after rerank (default: 3)
+	WebFetchTopN int `yaml:"web_fetch_top_n" json:"web_fetch_top_n,omitempty"`
 
 	// ===== Multi-turn Conversation Settings =====
 	// Whether multi-turn conversation is enabled
@@ -145,12 +228,23 @@ type CustomAgentConfig struct {
 	RewritePromptSystem string `yaml:"rewrite_prompt_system" json:"rewrite_prompt_system"`
 	// Rewrite prompt user message template
 	RewritePromptUser string `yaml:"rewrite_prompt_user" json:"rewrite_prompt_user"`
+	// Dedicated chat model ID for the query-understanding (rewrite + intent) step.
+	// When empty, the main conversation ModelID is used as a fallback.
+	QueryUnderstandModelID string `yaml:"query_understand_model_id" json:"query_understand_model_id,omitempty"`
 	// Fallback strategy: "fixed" for fixed response, "model" for model generation
 	FallbackStrategy string `yaml:"fallback_strategy" json:"fallback_strategy"`
 	// Fixed fallback response (when FallbackStrategy is "fixed")
 	FallbackResponse string `yaml:"fallback_response" json:"fallback_response"`
 	// Fallback prompt (when FallbackStrategy is "model")
 	FallbackPrompt string `yaml:"fallback_prompt" json:"fallback_prompt"`
+	// IntentPrompts holds per-intent system prompt overrides for non-retrieval
+	// intents (greeting, chitchat, etc.). Empty values fall back to templates
+	// under config/prompt_templates/intent_prompts.yaml.
+	IntentPrompts map[string]string `yaml:"intent_prompts" json:"intent_prompts,omitempty"`
+
+	// ===== Suggested Prompts =====
+	// 推荐问题列表，用于在前端对话面板展示快捷提问
+	SuggestedPrompts []string `yaml:"suggested_prompts" json:"suggested_prompts,omitempty"`
 }
 
 // Value implements driver.Valuer interface for CustomAgentConfig
@@ -163,8 +257,13 @@ func (c *CustomAgentConfig) Scan(value interface{}) error {
 	if value == nil {
 		return nil
 	}
-	b, ok := value.([]byte)
-	if !ok {
+	var b []byte
+	switch v := value.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
 		return nil
 	}
 	return json.Unmarshal(b, c)
@@ -180,7 +279,7 @@ func (a *CustomAgent) EnsureDefaults() {
 	if a == nil {
 		return
 	}
-	if a.Config.Temperature == 0 {
+	if a.Config.Temperature < 0 {
 		a.Config.Temperature = 0.7
 	}
 	if a.Config.MaxIterations == 0 {
@@ -205,9 +304,6 @@ func (a *CustomAgent) EnsureDefaults() {
 	if a.Config.RerankTopK == 0 {
 		a.Config.RerankTopK = 5
 	}
-	if a.Config.RerankThreshold == 0 {
-		a.Config.RerankThreshold = 0.5
-	}
 	// Advanced settings defaults
 	if a.Config.FallbackStrategy == "" {
 		a.Config.FallbackStrategy = "model"
@@ -219,6 +315,12 @@ func (a *CustomAgent) EnsureDefaults() {
 	if a.Config.AgentMode == AgentModeSmartReasoning {
 		a.Config.MultiTurnEnabled = true
 	}
+	// Pin thinking to an explicit false when unset so provider-specific wire
+	// formats (e.g. thinking_control=thinking_type) always receive a value.
+	if a.Config.Thinking == nil {
+		disabled := false
+		a.Config.Thinking = &disabled
+	}
 }
 
 // IsAgentMode returns true if this agent uses ReAct agent mode
@@ -226,181 +328,33 @@ func (a *CustomAgent) IsAgentMode() bool {
 	return a.Config.AgentMode == AgentModeSmartReasoning
 }
 
-// GetBuiltinQuickAnswerAgent returns the built-in quick answer (RAG) mode agent
-func GetBuiltinQuickAnswerAgent(tenantID uint64) *CustomAgent {
-	return &CustomAgent{
-		ID:          BuiltinQuickAnswerID,
-		Name:        "快速问答",
-		Description: "基于知识库的 RAG 问答，快速准确地回答问题",
-		IsBuiltin:   true,
-		TenantID:    tenantID,
-		Config: CustomAgentConfig{
-			AgentMode:    AgentModeQuickAnswer,
-			SystemPrompt: "",
-			ContextTemplate: `请根据以下参考资料回答用户问题。
-
-参考资料：
-{{contexts}}
-
-用户问题：{{query}}`,
-			Temperature:         0.7,
-			MaxCompletionTokens: 2048,
-			WebSearchEnabled:    true,
-			WebSearchMaxResults: 5,
-			MultiTurnEnabled:    true,
-			HistoryTurns:        5,
-			KBSelectionMode:     "all",
-			// FAQ strategy
-			FAQPriorityEnabled:       true,
-			FAQDirectAnswerThreshold: 0.9,
-			FAQScoreBoost:            1.2,
-			// Retrieval strategy
-			EmbeddingTopK:    10,
-			KeywordThreshold: 0.3,
-			VectorThreshold:  0.5,
-			RerankTopK:       10,
-			RerankThreshold:  0.3,
-			// Advanced settings
-			EnableQueryExpansion: true,
-			EnableRewrite:        true,
-			FallbackStrategy:     "model",
-		},
-	}
+// SuggestedQuestion 推荐问题
+type SuggestedQuestion struct {
+	// 问题文本
+	Question string `json:"question"`
+	// 来源类型: "agent_config", "faq", "document", "wiki"
+	Source string `json:"source"`
+	// 来源知识库ID（仅 faq/document/wiki 来源时有值）
+	KnowledgeBaseID string `json:"knowledge_base_id,omitempty"`
 }
 
-// GetBuiltinSmartReasoningAgent returns the built-in smart reasoning (ReAct) mode agent
-func GetBuiltinSmartReasoningAgent(tenantID uint64) *CustomAgent {
-	return &CustomAgent{
-		ID:          BuiltinSmartReasoningID,
-		Name:        "智能推理",
-		Description: "ReAct 推理框架，支持多步思考和工具调用",
-		IsBuiltin:   true,
-		TenantID:    tenantID,
-		Config: CustomAgentConfig{
-			AgentMode:           AgentModeSmartReasoning,
-			SystemPrompt:        "",
-			Temperature:         0.7,
-			MaxCompletionTokens: 2048,
-			MaxIterations:       50,
-			KBSelectionMode:     "all",
-			AllowedTools:        []string{"thinking", "todo_write", "knowledge_search", "grep_chunks", "list_knowledge_chunks", "query_knowledge_graph", "get_document_info"},
-			WebSearchEnabled:    true,
-			WebSearchMaxResults: 5,
-			ReflectionEnabled:   false,
-			MultiTurnEnabled:    true,
-			HistoryTurns:        5,
-			// FAQ strategy
-			FAQPriorityEnabled:       true,
-			FAQDirectAnswerThreshold: 0.9,
-			FAQScoreBoost:            1.2,
-			// Retrieval strategy
-			EmbeddingTopK:    10,
-			KeywordThreshold: 0.3,
-			VectorThreshold:  0.5,
-			RerankTopK:       10,
-			RerankThreshold:  0.3,
-		},
-	}
-}
-
-// GetBuiltinDataAnalystAgent returns the built-in data analyst agent
-// This agent specializes in analyzing CSV/Excel data using SQL queries via DuckDB
-func GetBuiltinDataAnalystAgent(tenantID uint64) *CustomAgent {
-	return &CustomAgent{
-		ID:          BuiltinDataAnalystID,
-		Name:        "数据分析师",
-		Description: "专业数据分析智能体，支持 CSV/Excel 文件的 SQL 查询与统计分析",
-		Avatar:      "📊",
-		IsBuiltin:   true,
-		TenantID:    tenantID,
-		Config: CustomAgentConfig{
-			AgentMode:           AgentModeSmartReasoning,
-			SystemPrompt: `### Role
-You are WeKnora Data Analyst, an intelligent data analysis assistant powered by DuckDB. You specialize in analyzing structured data from CSV and Excel files using SQL queries.
-
-### Mission
-Help users explore, analyze, and derive insights from their tabular data through intelligent SQL query generation and execution.
-
-### Critical Constraints
-1. **Schema First:** ALWAYS call data_schema before writing any SQL query to understand the table structure.
-2. **Read-Only:** Only SELECT queries allowed. INSERT, UPDATE, DELETE, CREATE, DROP are forbidden.
-3. **Iterative Refinement:** If a query fails, analyze the error and refine your approach.
-
-### Workflow
-1. **Understand:** Call data_schema to get table name, columns, types, and row count.
-2. **Plan:** For complex questions, use todo_write to break into sub-queries.
-3. **Query:** Call data_analysis with the knowledge_id and SQL query.
-4. **Analyze:** Interpret results and provide insights.
-
-### SQL Best Practices for DuckDB
-- Use double quotes for identifiers: SELECT "Column Name" FROM "table_name"
-- Aggregate functions: COUNT(*), SUM(), AVG(), MIN(), MAX(), MEDIAN(), STDDEV()
-- String matching: LIKE, ILIKE (case-insensitive), REGEXP
-- Use LIMIT to prevent overwhelming output (default to 100 rows max)
-
-### Tool Guidelines
-- **data_schema:** ALWAYS use first. Required before any query.
-- **data_analysis:** Execute SQL queries. Only SELECT queries allowed.
-- **thinking:** Plan complex analyses, debug query issues.
-- **todo_write:** Track multi-step analysis tasks.
-
-### Output Standards
-- Present results in well-formatted tables or summaries
-- Provide actionable insights, not just raw numbers
-- Relate findings back to the user's original question
-
-Current Time: {{current_time}}
-`,
-			Temperature:         0.3, // Lower temperature for precise SQL generation
-			MaxCompletionTokens: 4096,
-			MaxIterations:       30,
-			KBSelectionMode:     "all",
-			// Only support CSV and Excel files for data analysis
-			// Use standard values (xlsx), backend will auto-include xls via alias
-			SupportedFileTypes: []string{"csv", "xlsx"},
-			// Core tools for data analysis
-			AllowedTools: []string{
-				"thinking",
-				"todo_write",
-				"data_schema",   // Get table schema information
-				"data_analysis", // Execute SQL queries on data
-			},
-			WebSearchEnabled:    false, // Data analysis doesn't need web search
-			WebSearchMaxResults: 0,
-			ReflectionEnabled:   true, // Enable reflection for query optimization
-			MultiTurnEnabled:    true,
-			HistoryTurns:        10, // More history for iterative analysis
-			// Retrieval strategy (minimal, as we focus on data tools)
-			EmbeddingTopK:    5,
-			KeywordThreshold: 0.3,
-			VectorThreshold:  0.5,
-			RerankTopK:       5,
-			RerankThreshold:  0.3,
-		},
-	}
-}
-
-// Deprecated: Use GetBuiltinQuickAnswerAgent instead
-func GetBuiltinNormalAgent(tenantID uint64) *CustomAgent {
-	return GetBuiltinQuickAnswerAgent(tenantID)
-}
-
-// Deprecated: Use GetBuiltinSmartReasoningAgent instead
-func GetBuiltinAgentAgent(tenantID uint64) *CustomAgent {
-	return GetBuiltinSmartReasoningAgent(tenantID)
-}
-
-// BuiltinAgentRegistry provides a registry of all built-in agents for easy extension
-var BuiltinAgentRegistry = map[string]func(uint64) *CustomAgent{
-	BuiltinQuickAnswerID:    GetBuiltinQuickAnswerAgent,
-	BuiltinSmartReasoningID: GetBuiltinSmartReasoningAgent,
-	BuiltinDataAnalystID:    GetBuiltinDataAnalystAgent,
-}
+// BuiltinAgentRegistry provides a registry of all built-in agents.
+// It is initialised empty and populated by LoadBuiltinAgentsConfig from
+// config/builtin_agents.yaml at startup via rebuildRegistryFromConfig.
+var BuiltinAgentRegistry = map[string]func(uint64) *CustomAgent{}
 
 // builtinAgentIDsOrdered defines the fixed display order of built-in agents
+// that are exposed in the user-facing agent list (ListAgents).
+//
+// NOTE: BuiltinWikiFixerID is intentionally excluded here. The wiki fixer is
+// an internal agent invoked programmatically from the Wiki editor
+// (see frontend WikiBrowser.vue) and should not clutter the tenant's agent
+// picker. It remains fully usable via GetAgentByID because the YAML entry
+// still registers it in BuiltinAgentRegistry.
 var builtinAgentIDsOrdered = []string{
 	BuiltinQuickAnswerID,
 	BuiltinSmartReasoningID,
+	BuiltinWikiResearcherID,
 	BuiltinDeepResearcherID,
 	BuiltinDataAnalystID,
 	BuiltinKnowledgeGraphExpertID,

@@ -1,17 +1,6 @@
 <template>
   <div class="database-query-display">
-    <!-- Query Display -->
-    <div v-if="data.query" class="query-section">
-      <div class="section-header">{{ $t('chat.sqlQueryExecuted') }}</div>
-      <pre class="query-code">{{ data.query }}</pre>
-    </div>
-    
     <!-- Results Summary -->
-    <div class="results-summary">
-      <strong>{{ $t('chat.sqlResultsLabel') }}</strong> {{ data.row_count }} {{ $t('chat.rowsLabel') }}
-      <span v-if="data.columns"> × {{ data.columns.length }} {{ $t('chat.columnsLabel') }}</span>
-    </div>
-    
     <!-- Results Table -->
     <div v-if="data.rows && data.rows.length > 0" class="results-table-container">
       <table class="results-table">
@@ -62,53 +51,28 @@ const formatValue = (value: any): string => {
 <style lang="less" scoped>
 .database-query-display {
   font-size: 13px;
-  color: #333;
-}
-
-.query-section {
-  margin-bottom: 16px;
-}
-
-.section-header {
-  font-weight: 600;
-  color: #1f2937;
-  margin-bottom: 8px;
-  font-size: 13px;
-}
-
-.query-code {
-  background: #1e293b;
-  color: #e2e8f0;
-  padding: 12px;
-  border-radius: 6px;
-  overflow-x: auto;
-  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
+  color: var(--td-text-color-primary);
 }
 
 .results-summary {
   padding: 10px 12px;
-  background: #f0f9ff;
-  border-left: 3px solid #3b82f6;
+  background: var(--td-brand-color-light);
+  border-left: 3px solid var(--td-brand-color);
   border-radius: 4px;
   margin-bottom: 16px;
   font-size: 13px;
   
   strong {
-    color: #1e40af;
+    color: var(--td-brand-color);
     font-weight: 600;
   }
 }
 
 .results-table-container {
   overflow-x: auto;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--td-component-stroke);
   border-radius: 6px;
-  background: #fff;
+  background: var(--td-bg-color-container);
 }
 
 .results-table {
@@ -117,24 +81,24 @@ const formatValue = (value: any): string => {
   font-size: 12px;
   
   thead {
-    background: #f9fafb;
-    border-bottom: 2px solid #e5e7eb;
+    background: var(--td-bg-color-secondarycontainer);
+    border-bottom: 2px solid var(--td-component-stroke);
     
     th {
       padding: 10px 12px;
       text-align: left;
       font-weight: 600;
-      color: #374151;
+      color: var(--td-text-color-primary);
       white-space: nowrap;
     }
   }
   
   tbody {
     tr {
-      border-bottom: 1px solid #f3f4f6;
+      border-bottom: 1px solid var(--td-component-stroke);
       
       &:hover {
-        background: #f9fafb;
+        background: var(--td-bg-color-secondarycontainer);
       }
       
       &:last-child {
@@ -144,7 +108,7 @@ const formatValue = (value: any): string => {
     
     td {
       padding: 10px 12px;
-      color: #1f2937;
+      color: var(--td-text-color-primary);
       vertical-align: top;
       max-width: 400px;
       overflow: hidden;
@@ -156,11 +120,11 @@ const formatValue = (value: any): string => {
 .no-results {
   padding: 32px;
   text-align: center;
-  color: #9ca3af;
+  color: var(--td-text-color-placeholder);
   font-style: italic;
-  background: #f9fafb;
+  background: var(--td-bg-color-secondarycontainer);
   border-radius: 6px;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--td-component-stroke);
 }
 </style>
 

@@ -89,6 +89,22 @@ if [ "$STORAGE_TYPE" = "minio" ]; then
     check_var "MINIO_BUCKET_NAME"
 fi
 
+if [ "$STORAGE_TYPE" = "tos" ]; then
+    check_var "TOS_ENDPOINT"
+    check_var "TOS_REGION"
+    check_var "TOS_ACCESS_KEY"
+    check_var "TOS_SECRET_KEY"
+    check_var "TOS_BUCKET_NAME"
+fi
+
+if [ "$STORAGE_TYPE" = "s3" ]; then
+    check_var "S3_ENDPOINT"
+    check_var "S3_REGION"
+    check_var "S3_ACCESS_KEY"
+    check_var "S3_SECRET_KEY"
+    check_var "S3_BUCKET_NAME"
+fi
+
 echo ""
 log_info "Redis 配置:"
 check_var "REDIS_ADDR"
@@ -127,7 +143,7 @@ if command -v air &> /dev/null; then
     log_success "Air 已安装（支持热重载）"
 else
     log_warning "Air 未安装（可选，用于热重载）"
-    log_info "安装命令: go install github.com/cosmtrek/air@latest"
+    log_info "安装命令: go install github.com/air-verse/air@latest"
 fi
 
 # 检查 npm
@@ -193,4 +209,3 @@ printf "%b\n" "${GREEN}========================================${NC}"
 echo ""
 
 exit $errors
-

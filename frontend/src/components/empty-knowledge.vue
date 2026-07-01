@@ -20,8 +20,8 @@ const { t } = useI18n()
 }
 
 .empty-txt {
-    color: #00000099;
-    font-family: "PingFang SC";
+    color: var(--td-text-color-placeholder);
+    font-family: var(--app-font-family);
     font-size: 16px;
     font-weight: 600;
     line-height: 26px;
@@ -29,9 +29,9 @@ const { t } = useI18n()
 }
 
 .empty-type-txt {
-    color: #00000066;
+    color: var(--td-text-color-disabled);
     text-align: center;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 12px;
     font-weight: 400;
     width: 217px;

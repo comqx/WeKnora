@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
@@ -40,9 +44,38 @@ func (c *OllamaChat) convertMessages(messages []Message) []ollamaapi.Message {
 		if msg.Role == "tool" {
 			msgOllama.ToolName = msg.Name
 		}
+		if len(msg.Images) > 0 && msg.Role == "user" {
+			for _, imgURL := range msg.Images {
+				if imgData := resolveImageForOllama(imgURL); imgData != nil {
+					msgOllama.Images = append(msgOllama.Images, imgData)
+				}
+			}
+		}
 		ollamaMessages = append(ollamaMessages, msgOllama)
 	}
 	return ollamaMessages
+}
+
+// resolveImageForOllama resolves an image URL into raw bytes for Ollama.
+// Handles local serving paths (/files/...), data URIs, and remote HTTP URLs.
+func resolveImageForOllama(imageURL string) ollamaapi.ImageData {
+	if data := resolveImageURLForOllama(imageURL); data != nil {
+		return data
+	}
+	if strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://") {
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Get(imageURL)
+		if err != nil {
+			return nil
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+		if err != nil {
+			return nil
+		}
+		return data
+	}
+	return nil
 }
 
 // buildChatRequest 构建聊天请求参数
@@ -60,9 +93,7 @@ func (c *OllamaChat) buildChatRequest(messages []Message, opts *ChatOptions, isS
 
 	// 添加可选参数
 	if opts != nil {
-		if opts.Temperature > 0 {
-			chatReq.Options["temperature"] = opts.Temperature
-		}
+		chatReq.Options["temperature"] = opts.Temperature
 		if opts.TopP > 0 {
 			chatReq.Options["top_p"] = opts.TopP
 		}
@@ -105,6 +136,10 @@ func (c *OllamaChat) Chat(ctx context.Context, messages []Message, opts *ChatOpt
 	// 使用 Ollama 客户端发送请求
 	err := c.ollamaService.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
 		responseContent = resp.Message.Content
+		// 当 Content 为空但 Thinking 有内容时（如推理模型未正确配置 thinking 参数），使用 Thinking 作为兜底
+		if responseContent == "" && resp.Message.Thinking != "" {
+			responseContent = resp.Message.Thinking
+		}
 		toolCalls = c.toolCallTo(resp.Message.ToolCalls)
 
 		// 获取token计数
@@ -119,19 +154,17 @@ func (c *OllamaChat) Chat(ctx context.Context, messages []Message, opts *ChatOpt
 		return nil, fmt.Errorf("聊天请求失败: %w", err)
 	}
 
-	// 构建响应
+	usage := types.TokenUsage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+	}
+	logUsage(ctx, c.modelName, &usage)
+
 	return &types.ChatResponse{
 		Content:   responseContent,
 		ToolCalls: toolCalls,
-		Usage: struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		}{
-			PromptTokens:     promptTokens,
-			CompletionTokens: completionTokens,
-			TotalTokens:      promptTokens + completionTokens,
-		},
+		Usage:     usage,
 	}, nil
 }
 
@@ -159,8 +192,16 @@ func (c *OllamaChat) ChatStream(
 	go func() {
 		defer close(streamChan)
 
+		var thinking thinkingEmitter
 		err := c.ollamaService.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
+			// 发送思考内容（支持 Qwen3、DeepSeek 等推理模型）
+			if resp.Message.Thinking != "" {
+				thinking.emit(streamChan, resp.Message.Thinking)
+			}
+
 			if resp.Message.Content != "" {
+				// 思考阶段结束后，发送思考完成事件
+				thinking.finish(streamChan)
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Content:      resp.Message.Content,
@@ -174,12 +215,51 @@ func (c *OllamaChat) ChatStream(
 					ToolCalls:    c.toolCallTo(resp.Message.ToolCalls),
 					Done:         false,
 				}
+
+				// Ollama returns tool calls as complete objects (not incremental deltas).
+				// Log this so we can trace non-streaming thought delivery.
+				for _, tc := range resp.Message.ToolCalls {
+					if tc.Function.Name == "thinking" {
+						argsBytes, _ := json.Marshal(tc.Function.Arguments)
+						logger.Warnf(ctx, "[Ollama Stream] Tool %q arrived non-incrementally (%d bytes args), "+
+							"thought will not be token-streamed to frontend",
+							tc.Function.Name, len(argsBytes))
+					}
+				}
+
+				for _, tc := range resp.Message.ToolCalls {
+					argsMap := tc.Function.Arguments.ToMap()
+					switch tc.Function.Name {
+					case "thinking":
+						if thought, ok := argsMap["thought"].(string); ok && thought != "" {
+							streamChan <- types.StreamResponse{
+								ResponseType: types.ResponseTypeThinking,
+								Content:      thought,
+								Done:         false,
+								Data: map[string]interface{}{
+									"source":       "thinking_tool",
+									"tool_call_id": tooli2s(tc.Function.Index),
+								},
+							}
+						}
+					}
+				}
 			}
 
 			if resp.Done {
+				var usage *types.TokenUsage
+				if resp.PromptEvalCount > 0 || resp.EvalCount > 0 {
+					usage = &types.TokenUsage{
+						PromptTokens:     resp.PromptEvalCount,
+						CompletionTokens: resp.EvalCount,
+						TotalTokens:      resp.PromptEvalCount + resp.EvalCount,
+					}
+				}
+				logUsage(ctx, c.modelName, usage)
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Done:         true,
+					Usage:        usage,
 				}
 			}
 
@@ -265,9 +345,9 @@ func (c *OllamaChat) toolCallFrom(toolCalls []ToolCall) []ollamaapi.ToolCall {
 	}
 	ollamaToolCalls := make([]ollamaapi.ToolCall, 0, len(toolCalls))
 	for _, tc := range toolCalls {
-		var args map[string]interface{}
+		args := ollamaapi.NewToolCallFunctionArguments()
 		if tc.Function.Arguments != "" {
-			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			_ = args.UnmarshalJSON([]byte(tc.Function.Arguments))
 		}
 		ollamaToolCalls = append(ollamaToolCalls, ollamaapi.ToolCall{
 			Function: ollamaapi.ToolCallFunction{

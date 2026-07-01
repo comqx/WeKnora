@@ -19,7 +19,7 @@ type CustomAgentService interface {
 	//   - Possible errors such as insufficient permissions, validation errors, etc.
 	CreateAgent(ctx context.Context, agent *types.CustomAgent) (*types.CustomAgent, error)
 
-	// GetAgentByID retrieves agent information by ID
+	// GetAgentByID retrieves agent information by ID (uses tenant from context)
 	// Parameters:
 	//   - ctx: Context information
 	//   - id: Unique identifier of the agent
@@ -27,6 +27,9 @@ type CustomAgentService interface {
 	//   - Agent object, if found (including built-in agents)
 	//   - Possible errors such as not existing, insufficient permissions, etc.
 	GetAgentByID(ctx context.Context, id string) (*types.CustomAgent, error)
+
+	// GetAgentByIDAndTenant retrieves agent by ID and tenant (for shared agents; skips built-in resolution)
+	GetAgentByIDAndTenant(ctx context.Context, id string, tenantID uint64) (*types.CustomAgent, error)
 
 	// ListAgents lists all agents under the current tenant (including built-in agents)
 	// Parameters:
@@ -61,6 +64,21 @@ type CustomAgentService interface {
 	//   - The newly created agent copy
 	//   - Possible errors such as not existing, insufficient permissions, etc.
 	CopyAgent(ctx context.Context, id string) (*types.CustomAgent, error)
+
+	// GetSuggestedQuestions returns suggested questions for the agent based on its
+	// associated knowledge bases. When kbIDs or knowledgeIDs are provided, they override
+	// the agent's default knowledge base selection.
+	// Parameters:
+	//   - ctx: Context information
+	//   - agentID: Agent ID
+	//   - kbIDs: Optional knowledge base IDs to override agent config
+	//   - knowledgeIDs: Optional knowledge item IDs to further filter
+	//   - tagIDs: Optional knowledge tag IDs; resolved to knowledge item IDs (OR semantics)
+	//   - limit: Maximum number of questions to return
+	// Returns:
+	//   - List of suggested questions
+	//   - Possible errors
+	GetSuggestedQuestions(ctx context.Context, agentID string, kbIDs []string, knowledgeIDs []string, tagIDs []string, limit int) ([]types.SuggestedQuestion, error)
 }
 
 // CustomAgentRepository defines the custom agent repository interface
@@ -109,4 +127,8 @@ type CustomAgentRepository interface {
 	// Returns:
 	//   - Possible errors such as record not existing, database errors, etc.
 	DeleteAgent(ctx context.Context, id string, tenantID uint64) error
+
+	// CountByModelID counts active agents in the tenant whose config references
+	// the given model ID (chat, rerank, VLM, ASR, query-understand, etc.).
+	CountByModelID(ctx context.Context, tenantID uint64, modelID string) (int64, error)
 }

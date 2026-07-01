@@ -1,4 +1,5 @@
 import { MessagePlugin } from "tdesign-vue-next";
+import i18n from '@/i18n';
 
 // 声明全局运行时配置类型
 declare global {
@@ -11,7 +12,7 @@ declare global {
 
 // 从运行时配置获取最大文件大小(MB)，支持 Docker 环境动态配置
 // 优先级：运行时配置 > 构建时环境变量 > 默认值 50MB
-const MAX_FILE_SIZE_MB = window.__RUNTIME_CONFIG__?.MAX_FILE_SIZE_MB 
+export const MAX_FILE_SIZE_MB = window.__RUNTIME_CONFIG__?.MAX_FILE_SIZE_MB
   || Number(import.meta.env.VITE_MAX_FILE_SIZE_MB) 
   || 50;
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
@@ -39,29 +40,32 @@ export function formatStringDate(date: any) {
     year + "-" + month + "-" + day + " " + hour + ":" + minute + ":" + second
   );
 }
-export function kbFileTypeVerification(file: any, silent = false) {
-  let validTypes = ["pdf", "txt", "md", "docx", "doc", "jpg", "jpeg", "png", "csv", "xlsx", "xls"];
-  let type = file.name.substring(file.name.lastIndexOf(".") + 1);
-  if (!validTypes.includes(type)) {
+const DEFAULT_VALID_TYPES = new Set(["pdf", "txt", "md", "docx", "doc", "pptx", "ppt", "epub", "mhtml", "jpg", "jpeg", "png", "csv", "xlsx", "xls", "mp3", "wav", "m4a", "flac", "ogg"]);
+
+/**
+ * Returns true when the file should be **rejected**.
+ * @param validTypes - override the default extension whitelist with a dynamic set (e.g. from engine registry).
+ */
+export function kbFileTypeVerification(file: any, silent = false, validTypes?: Set<string> | string[]) {
+  const provided = validTypes
+    ? (validTypes instanceof Set ? validTypes : new Set(validTypes))
+    : undefined;
+  // An empty whitelist means the engine registry hasn't loaded yet; fall back to
+  // the default set rather than rejecting every file.
+  const allowed = provided && provided.size > 0 ? provided : DEFAULT_VALID_TYPES;
+
+  const type = file.name.substring(file.name.lastIndexOf(".") + 1).toLowerCase();
+  if (!allowed.has(type)) {
     if (!silent) {
-      MessagePlugin.error("文件类型错误！");
+      MessagePlugin.error(i18n.global.t('error.unsupportedFileType'));
     }
     return true;
   }
-  if (
-    (type == "pdf" || type == "docx" || type == "doc") &&
-    file.size > MAX_FILE_SIZE_BYTES
-  ) {
+  if (file.size > MAX_FILE_SIZE_BYTES) {
     if (!silent) {
-      MessagePlugin.error(`pdf/doc文件不能超过${MAX_FILE_SIZE_MB}M！`);
+      MessagePlugin.error(i18n.global.t('error.fileSizeExceeded', { size: MAX_FILE_SIZE_MB }));
     }
     return true;
   }
-  if ((type == "txt" || type == "md") && file.size > MAX_FILE_SIZE_BYTES) {
-    if (!silent) {
-      MessagePlugin.error(`txt/md文件不能超过${MAX_FILE_SIZE_MB}M！`);
-    }
-    return true;
-  }
-  return false
+  return false;
 }

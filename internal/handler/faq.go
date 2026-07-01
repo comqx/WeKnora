@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -13,13 +14,47 @@ import (
 )
 
 // FAQHandler handles FAQ knowledge base operations.
+//
+// All KB-access checks (own / org-shared / via shared agent) are now
+// performed by the route-level g.KBAccessRead / g.KBAccessWrite
+// guards in router.go — the guard rewrites c.Request.Context() to
+// carry the effective tenant ID for the duration of the handler, so
+// the handler reads tenant from context the way it always did.
 type FAQHandler struct {
 	knowledgeService interfaces.KnowledgeService
+	kbService        interfaces.KnowledgeBaseService
 }
 
-// NewFAQHandler creates a new FAQ handler
-func NewFAQHandler(knowledgeService interfaces.KnowledgeService) *FAQHandler {
-	return &FAQHandler{knowledgeService: knowledgeService}
+// NewFAQHandler creates a new FAQ handler.
+func NewFAQHandler(
+	knowledgeService interfaces.KnowledgeService,
+	kbService interfaces.KnowledgeBaseService,
+) *FAQHandler {
+	return &FAQHandler{
+		knowledgeService: knowledgeService,
+		kbService:        kbService,
+	}
+}
+
+// faqDeleteRequest is a request for deleting FAQ entries in batch
+type faqDeleteRequest struct {
+	IDs []int64 `json:"ids" binding:"required,min=1"`
+}
+
+// faqEntryTagBatchRequest is a request for updating tags for FAQ entries in batch
+// key: entry seq_id, value: tag seq_id (nil to remove tag)
+type faqEntryTagBatchRequest struct {
+	Updates map[int64]*int64 `json:"updates" binding:"required,min=1"`
+}
+
+// addSimilarQuestionsRequest is a request for adding similar questions to a FAQ entry
+type addSimilarQuestionsRequest struct {
+	SimilarQuestions []string `json:"similar_questions" binding:"required,min=1"`
+}
+
+// updateLastFAQImportResultDisplayStatusRequest is the request payload for UpdateLastImportResultDisplayStatus
+type updateLastFAQImportResultDisplayStatusRequest struct {
+	DisplayStatus string `json:"display_status" binding:"required,oneof=open close"`
 }
 
 // ListEntries godoc
@@ -31,7 +66,7 @@ func NewFAQHandler(knowledgeService interfaces.KnowledgeService) *FAQHandler {
 // @Param        id           path      string  true   "知识库ID"
 // @Param        page         query     int     false  "页码"
 // @Param        page_size    query     int     false  "每页数量"
-// @Param        tag_id       query     string  false  "标签ID筛选"
+// @Param        tag_id       query     int     false  "标签ID筛选(seq_id)"
 // @Param        keyword      query     string  false  "关键词搜索"
 // @Param        search_field query     string  false  "搜索字段: standard_question(标准问题), similar_questions(相似问法), answers(答案), 默认搜索全部"
 // @Param        sort_order   query     string  false  "排序方式: asc(按更新时间正序), 默认按更新时间倒序"
@@ -42,6 +77,8 @@ func NewFAQHandler(knowledgeService interfaces.KnowledgeService) *FAQHandler {
 // @Router       /knowledge-bases/{id}/faq/entries [get]
 func (h *FAQHandler) ListEntries(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var page types.Pagination
 	if err := c.ShouldBindQuery(&page); err != nil {
 		logger.Error(ctx, "Failed to bind pagination query", err)
@@ -49,12 +86,21 @@ func (h *FAQHandler) ListEntries(c *gin.Context) {
 		return
 	}
 
-	tagID := secutils.SanitizeForLog(c.Query("tag_id"))
+	var tagSeqID int64
+	tagIDStr := c.Query("tag_id")
+	if tagIDStr != "" {
+		var err error
+		tagSeqID, err = strconv.ParseInt(tagIDStr, 10, 64)
+		if err != nil {
+			c.Error(errors.NewBadRequestError("tag_id 必须是整数"))
+			return
+		}
+	}
 	keyword := secutils.SanitizeForLog(c.Query("keyword"))
 	searchField := secutils.SanitizeForLog(c.Query("search_field"))
 	sortOrder := secutils.SanitizeForLog(c.Query("sort_order"))
 
-	result, err := h.knowledgeService.ListFAQEntries(ctx, secutils.SanitizeForLog(c.Param("id")), &page, tagID, keyword, searchField, sortOrder)
+	result, err := h.knowledgeService.ListFAQEntries(ctx, kbID, &page, tagSeqID, keyword, searchField, sortOrder)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
@@ -69,7 +115,9 @@ func (h *FAQHandler) ListEntries(c *gin.Context) {
 
 // UpsertEntries godoc
 // @Summary      批量更新/插入FAQ条目
-// @Description  异步批量更新或插入FAQ条目
+// @Description  异步批量更新或插入FAQ条目。支持 dry_run 模式（设置 dry_run=true），异步验证不实际导入。
+// @Description  dry_run 模式是异步操作，返回 task_id，通过 /faq/import/progress/{task_id} 查询进度和结果。
+// @Description  验证内容包括：1) 条目基本格式 2) 重复问题（批次内和知识库已有） 3) 内容安全检查。
 // @Tags         FAQ管理
 // @Accept       json
 // @Produce      json
@@ -82,6 +130,8 @@ func (h *FAQHandler) ListEntries(c *gin.Context) {
 // @Router       /knowledge-bases/{id}/faq/entries [post]
 func (h *FAQHandler) UpsertEntries(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var req types.FAQBatchUpsertPayload
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to bind FAQ upsert payload", err)
@@ -89,7 +139,7 @@ func (h *FAQHandler) UpsertEntries(c *gin.Context) {
 		return
 	}
 
-	taskID, err := h.knowledgeService.UpsertFAQEntries(ctx, secutils.SanitizeForLog(c.Param("id")), &req)
+	taskID, err := h.knowledgeService.UpsertFAQEntries(ctx, kbID, &req)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
@@ -119,6 +169,8 @@ func (h *FAQHandler) UpsertEntries(c *gin.Context) {
 // @Router       /knowledge-bases/{id}/faq/entry [post]
 func (h *FAQHandler) CreateEntry(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var req types.FAQEntryPayload
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to bind FAQ entry payload", err)
@@ -126,7 +178,7 @@ func (h *FAQHandler) CreateEntry(c *gin.Context) {
 		return
 	}
 
-	entry, err := h.knowledgeService.CreateFAQEntry(ctx, secutils.SanitizeForLog(c.Param("id")), &req)
+	entry, err := h.knowledgeService.CreateFAQEntry(ctx, kbID, &req)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
@@ -146,7 +198,7 @@ func (h *FAQHandler) CreateEntry(c *gin.Context) {
 // @Accept       json
 // @Produce      json
 // @Param        id        path      string                true  "知识库ID"
-// @Param        entry_id  path      string                true  "FAQ条目ID"
+// @Param        entry_id  path      int                   true  "FAQ条目ID(seq_id)"
 // @Param        request   body      types.FAQEntryPayload true  "FAQ条目"
 // @Success      200       {object}  map[string]interface{}  "更新成功"
 // @Failure      400       {object}  errors.AppError         "请求参数错误"
@@ -155,6 +207,8 @@ func (h *FAQHandler) CreateEntry(c *gin.Context) {
 // @Router       /knowledge-bases/{id}/faq/entries/{entry_id} [put]
 func (h *FAQHandler) UpdateEntry(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var req types.FAQEntryPayload
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to bind FAQ entry payload", err)
@@ -162,8 +216,14 @@ func (h *FAQHandler) UpdateEntry(c *gin.Context) {
 		return
 	}
 
-	if err := h.knowledgeService.UpdateFAQEntry(ctx,
-		secutils.SanitizeForLog(c.Param("id")), secutils.SanitizeForLog(c.Param("entry_id")), &req); err != nil {
+	entrySeqID, err := strconv.ParseInt(c.Param("entry_id"), 10, 64)
+	if err != nil {
+		c.Error(errors.NewBadRequestError("entry_id 必须是整数"))
+		return
+	}
+
+	entry, err := h.knowledgeService.UpdateFAQEntry(ctx, kbID, entrySeqID, &req)
+	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
 		return
@@ -171,6 +231,7 @@ func (h *FAQHandler) UpdateEntry(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
+		"data":    entry,
 	})
 }
 
@@ -189,14 +250,15 @@ func (h *FAQHandler) UpdateEntry(c *gin.Context) {
 // @Router       /knowledge-bases/{id}/faq/entries/tags [put]
 func (h *FAQHandler) UpdateEntryTagBatch(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var req faqEntryTagBatchRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to bind FAQ entry tag batch payload", err)
 		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
 		return
 	}
-	if err := h.knowledgeService.UpdateFAQEntryTagBatch(ctx,
-		secutils.SanitizeForLog(c.Param("id")), req.Updates); err != nil {
+	if err := h.knowledgeService.UpdateFAQEntryTagBatch(ctx, kbID, req.Updates); err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
 		return
@@ -221,14 +283,15 @@ func (h *FAQHandler) UpdateEntryTagBatch(c *gin.Context) {
 // @Router       /knowledge-bases/{id}/faq/entries/fields [put]
 func (h *FAQHandler) UpdateEntryFieldsBatch(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var req types.FAQEntryFieldsBatchUpdate
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to bind FAQ entry fields batch payload", err)
 		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
 		return
 	}
-	if err := h.knowledgeService.UpdateFAQEntryFieldsBatch(ctx,
-		secutils.SanitizeForLog(c.Param("id")), &req); err != nil {
+	if err := h.knowledgeService.UpdateFAQEntryFieldsBatch(ctx, kbID, &req); err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
 		return
@@ -238,16 +301,6 @@ func (h *FAQHandler) UpdateEntryFieldsBatch(c *gin.Context) {
 	})
 }
 
-// faqDeleteRequest is a request for deleting FAQ entries in batch
-type faqDeleteRequest struct {
-	IDs []string `json:"ids" binding:"required,min=1,dive,required"`
-}
-
-// faqEntryTagBatchRequest is a request for updating tags for FAQ entries in batch
-type faqEntryTagBatchRequest struct {
-	Updates map[string]*string `json:"updates" binding:"required,min=1"`
-}
-
 // DeleteEntries godoc
 // @Summary      批量删除FAQ条目
 // @Description  批量删除指定的FAQ条目
@@ -255,7 +308,7 @@ type faqEntryTagBatchRequest struct {
 // @Accept       json
 // @Produce      json
 // @Param        id       path      string  true  "知识库ID"
-// @Param        request  body      object{ids=[]string}  true  "要删除的FAQ ID列表"
+// @Param        request  body      object{ids=[]int}  true  "要删除的FAQ ID列表(seq_id)"
 // @Success      200      {object}  map[string]interface{}  "删除成功"
 // @Failure      400      {object}  errors.AppError         "请求参数错误"
 // @Security     Bearer
@@ -263,6 +316,8 @@ type faqEntryTagBatchRequest struct {
 // @Router       /knowledge-bases/{id}/faq/entries [delete]
 func (h *FAQHandler) DeleteEntries(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var req faqDeleteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Errorf(ctx, "Failed to bind FAQ delete payload: %s", secutils.SanitizeForLog(err.Error()))
@@ -270,9 +325,7 @@ func (h *FAQHandler) DeleteEntries(c *gin.Context) {
 		return
 	}
 
-	if err := h.knowledgeService.DeleteFAQEntries(ctx,
-		secutils.SanitizeForLog(c.Param("id")),
-		secutils.SanitizeForLogArray(req.IDs)); err != nil {
+	if err := h.knowledgeService.DeleteFAQEntries(ctx, kbID, req.IDs); err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
 		return
@@ -298,6 +351,8 @@ func (h *FAQHandler) DeleteEntries(c *gin.Context) {
 // @Router       /knowledge-bases/{id}/faq/search [post]
 func (h *FAQHandler) SearchFAQ(c *gin.Context) {
 	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
 	var req types.FAQSearchRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to bind FAQ search payload", err)
@@ -311,7 +366,7 @@ func (h *FAQHandler) SearchFAQ(c *gin.Context) {
 	if req.MatchCount > 200 {
 		req.MatchCount = 200
 	}
-	entries, err := h.knowledgeService.SearchFAQEntries(ctx, secutils.SanitizeForLog(c.Param("id")), &req)
+	entries, err := h.knowledgeService.SearchFAQEntries(ctx, kbID, &req)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
@@ -362,7 +417,7 @@ func (h *FAQHandler) ExportEntries(c *gin.Context) {
 // @Accept       json
 // @Produce      json
 // @Param        id        path      string  true  "知识库ID"
-// @Param        entry_id  path      string  true  "FAQ条目ID"
+// @Param        entry_id  path      int     true  "FAQ条目ID(seq_id)"
 // @Success      200       {object}  map[string]interface{}  "FAQ条目详情"
 // @Failure      400       {object}  errors.AppError         "请求参数错误"
 // @Failure      404       {object}  errors.AppError         "条目不存在"
@@ -372,9 +427,14 @@ func (h *FAQHandler) ExportEntries(c *gin.Context) {
 func (h *FAQHandler) GetEntry(c *gin.Context) {
 	ctx := c.Request.Context()
 	kbID := secutils.SanitizeForLog(c.Param("id"))
-	entryID := secutils.SanitizeForLog(c.Param("entry_id"))
 
-	entry, err := h.knowledgeService.GetFAQEntry(ctx, kbID, entryID)
+	entrySeqID, err := strconv.ParseInt(c.Param("entry_id"), 10, 64)
+	if err != nil {
+		c.Error(errors.NewBadRequestError("entry_id 必须是整数"))
+		return
+	}
+
+	entry, err := h.knowledgeService.GetFAQEntry(ctx, kbID, entrySeqID)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
@@ -413,5 +473,86 @@ func (h *FAQHandler) GetImportProgress(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    progress,
+	})
+}
+
+// UpdateLastImportResultDisplayStatus godoc
+// @Summary      更新FAQ最后一次导入结果显示状态
+// @Description  更新FAQ知识库导入结果统计卡片的显示或隐藏状态
+// @Tags         FAQ管理
+// @Accept       json
+// @Produce      json
+// @Param        id      path      string                                         true  "知识库ID"
+// @Param        request body      updateLastFAQImportResultDisplayStatusRequest  true  "状态更新请求"
+// @Success      200     {object}  map[string]interface{}                         "更新成功"
+// @Failure      400     {object}  errors.AppError                                "请求参数错误"
+// @Failure      404     {object}  errors.AppError                                "知识库不存在或无导入记录"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge-bases/{id}/faq/import/last-result/display [put]
+func (h *FAQHandler) UpdateLastImportResultDisplayStatus(c *gin.Context) {
+	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
+	var req updateLastFAQImportResultDisplayStatusRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(ctx, "Failed to bind display status update payload", err)
+		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+		return
+	}
+
+	if err := h.knowledgeService.UpdateLastFAQImportResultDisplayStatus(ctx, kbID, req.DisplayStatus); err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+	})
+}
+
+// AddSimilarQuestions godoc
+// @Summary      添加相似问
+// @Description  向指定的FAQ条目添加相似问题
+// @Tags         FAQ管理
+// @Accept       json
+// @Produce      json
+// @Param        id        path      string                      true  "知识库ID"
+// @Param        entry_id  path      int                         true  "FAQ条目ID(seq_id)"
+// @Param        request   body      addSimilarQuestionsRequest  true  "相似问列表"
+// @Success      200       {object}  map[string]interface{}      "更新后的FAQ条目"
+// @Failure      400       {object}  errors.AppError             "请求参数错误"
+// @Failure      404       {object}  errors.AppError             "条目不存在"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge-bases/{id}/faq/entries/{entry_id}/similar-questions [post]
+func (h *FAQHandler) AddSimilarQuestions(c *gin.Context) {
+	ctx := c.Request.Context()
+	kbID := secutils.SanitizeForLog(c.Param("id"))
+
+	entrySeqID, err := strconv.ParseInt(c.Param("entry_id"), 10, 64)
+	if err != nil {
+		c.Error(errors.NewBadRequestError("entry_id 必须是整数"))
+		return
+	}
+
+	var req addSimilarQuestionsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(ctx, "Failed to bind add similar questions payload", err)
+		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+		return
+	}
+
+	entry, err := h.knowledgeService.AddSimilarQuestions(ctx, kbID, entrySeqID, req.SimilarQuestions)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    entry,
 	})
 }

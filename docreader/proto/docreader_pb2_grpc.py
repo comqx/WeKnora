@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-import docreader_pb2 as docreader__pb2
+from docreader.proto import docreader_pb2 as docreader__pb2
 
-GRPC_GENERATED_VERSION = '1.76.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -26,8 +26,7 @@ if _version_not_supported:
 
 
 class DocReaderStub(object):
-    """文档读取服务
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -35,32 +34,46 @@ class DocReaderStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.ReadFromFile = channel.unary_unary(
-                '/docreader.DocReader/ReadFromFile',
-                request_serializer=docreader__pb2.ReadFromFileRequest.SerializeToString,
+        self.Read = channel.unary_unary(
+                '/docreader.DocReader/Read',
+                request_serializer=docreader__pb2.ReadRequest.SerializeToString,
                 response_deserializer=docreader__pb2.ReadResponse.FromString,
                 _registered_method=True)
-        self.ReadFromURL = channel.unary_unary(
-                '/docreader.DocReader/ReadFromURL',
-                request_serializer=docreader__pb2.ReadFromURLRequest.SerializeToString,
-                response_deserializer=docreader__pb2.ReadResponse.FromString,
+        self.ReadStream = channel.unary_stream(
+                '/docreader.DocReader/ReadStream',
+                request_serializer=docreader__pb2.ReadRequest.SerializeToString,
+                response_deserializer=docreader__pb2.ReadStreamResponse.FromString,
+                _registered_method=True)
+        self.ListEngines = channel.unary_unary(
+                '/docreader.DocReader/ListEngines',
+                request_serializer=docreader__pb2.ListEnginesRequest.SerializeToString,
+                response_deserializer=docreader__pb2.ListEnginesResponse.FromString,
                 _registered_method=True)
 
 
 class DocReaderServicer(object):
-    """文档读取服务
-    """
+    """Missing associated documentation comment in .proto file."""
 
-    def ReadFromFile(self, request, context):
-        """从文件读取文档
+    def Read(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReadStream(self, request, context):
+        """ReadStream is the streaming counterpart of Read. It first emits one
+        ReadStreamResponse carrying the parse metadata (markdown / metadata /
+        error), then emits one message per image. This keeps every gRPC message
+        small so large scanned PDFs (hundreds of page images, far exceeding the
+        unary message-size cap) can be returned without RESOURCE_EXHAUSTED and
+        with bounded memory on both ends.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ReadFromURL(self, request, context):
-        """从URL读取文档
-        """
+    def ListEngines(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -68,15 +81,20 @@ class DocReaderServicer(object):
 
 def add_DocReaderServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'ReadFromFile': grpc.unary_unary_rpc_method_handler(
-                    servicer.ReadFromFile,
-                    request_deserializer=docreader__pb2.ReadFromFileRequest.FromString,
+            'Read': grpc.unary_unary_rpc_method_handler(
+                    servicer.Read,
+                    request_deserializer=docreader__pb2.ReadRequest.FromString,
                     response_serializer=docreader__pb2.ReadResponse.SerializeToString,
             ),
-            'ReadFromURL': grpc.unary_unary_rpc_method_handler(
-                    servicer.ReadFromURL,
-                    request_deserializer=docreader__pb2.ReadFromURLRequest.FromString,
-                    response_serializer=docreader__pb2.ReadResponse.SerializeToString,
+            'ReadStream': grpc.unary_stream_rpc_method_handler(
+                    servicer.ReadStream,
+                    request_deserializer=docreader__pb2.ReadRequest.FromString,
+                    response_serializer=docreader__pb2.ReadStreamResponse.SerializeToString,
+            ),
+            'ListEngines': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListEngines,
+                    request_deserializer=docreader__pb2.ListEnginesRequest.FromString,
+                    response_serializer=docreader__pb2.ListEnginesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -87,11 +105,10 @@ def add_DocReaderServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class DocReader(object):
-    """文档读取服务
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def ReadFromFile(request,
+    def Read(request,
             target,
             options=(),
             channel_credentials=None,
@@ -104,8 +121,8 @@ class DocReader(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/docreader.DocReader/ReadFromFile',
-            docreader__pb2.ReadFromFileRequest.SerializeToString,
+            '/docreader.DocReader/Read',
+            docreader__pb2.ReadRequest.SerializeToString,
             docreader__pb2.ReadResponse.FromString,
             options,
             channel_credentials,
@@ -118,7 +135,34 @@ class DocReader(object):
             _registered_method=True)
 
     @staticmethod
-    def ReadFromURL(request,
+    def ReadStream(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/docreader.DocReader/ReadStream',
+            docreader__pb2.ReadRequest.SerializeToString,
+            docreader__pb2.ReadStreamResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListEngines(request,
             target,
             options=(),
             channel_credentials=None,
@@ -131,9 +175,9 @@ class DocReader(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/docreader.DocReader/ReadFromURL',
-            docreader__pb2.ReadFromURLRequest.SerializeToString,
-            docreader__pb2.ReadResponse.FromString,
+            '/docreader.DocReader/ListEngines',
+            docreader__pb2.ListEnginesRequest.SerializeToString,
+            docreader__pb2.ListEnginesResponse.FromString,
             options,
             channel_credentials,
             insecure,

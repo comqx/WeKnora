@@ -26,36 +26,30 @@ type loggerResponseBodyWriter struct {
 }
 
 // Write 重写Write方法，同时写入buffer和原始writer
+// 限制buffer大小，避免SSE等流式响应导致内存无限增长
 func (r loggerResponseBodyWriter) Write(b []byte) (int, error) {
-	r.body.Write(b)
+	if r.body.Len() < maxBodySize {
+		remaining := maxBodySize - r.body.Len()
+		if len(b) <= remaining {
+			r.body.Write(b)
+		} else {
+			r.body.Write(b[:remaining])
+		}
+	}
 	return r.ResponseWriter.Write(b)
 }
 
+// sensitiveFieldRegex 匹配 JSON 中的敏感字段（不区分大小写，兼容 snake_case / camelCase / PascalCase）。
+// $1 捕获原始字段名（包括两侧引号），保持日志中的字段名不变，仅将值替换为 "***"。
+var sensitiveFieldRegex = regexp.MustCompile(
+	`(?i)("(?:password|passwd|token|access[_-]?token|refresh[_-]?token|id[_-]?token|` +
+		`authorization|auth[_-]?token|api[_-]?key|api[_-]?secret|secret[_-]?key|` +
+		`client[_-]?secret|private[_-]?key|secret)")\s*:\s*"[^"]*"`,
+)
+
 // sanitizeBody 清理敏感信息
 func sanitizeBody(body string) string {
-	result := body
-	// 替换常见的敏感字段（JSON格式）
-	sensitivePatterns := []struct {
-		pattern     string
-		replacement string
-	}{
-		{`"password"\s*:\s*"[^"]*"`, `"password":"***"`},
-		{`"token"\s*:\s*"[^"]*"`, `"token":"***"`},
-		{`"access_token"\s*:\s*"[^"]*"`, `"access_token":"***"`},
-		{`"refresh_token"\s*:\s*"[^"]*"`, `"refresh_token":"***"`},
-		{`"authorization"\s*:\s*"[^"]*"`, `"authorization":"***"`},
-		{`"api_key"\s*:\s*"[^"]*"`, `"api_key":"***"`},
-		{`"secret"\s*:\s*"[^"]*"`, `"secret":"***"`},
-		{`"apikey"\s*:\s*"[^"]*"`, `"apikey":"***"`},
-		{`"apisecret"\s*:\s*"[^"]*"`, `"apisecret":"***"`},
-	}
-
-	for _, p := range sensitivePatterns {
-		re := regexp.MustCompile(p.pattern)
-		result = re.ReplaceAllString(result, p.replacement)
-	}
-
-	return result
+	return sensitiveFieldRegex.ReplaceAllString(body, `$1:"***"`)
 }
 
 // readRequestBody 读取请求体（限制大小用于日志，但完整读取用于重置）
@@ -136,6 +130,12 @@ func Logger() gin.HandlerFunc {
 		path := c.Request.URL.Path
 		raw := c.Request.URL.RawQuery
 
+		isWikiStats := strings.HasPrefix(path, "/api/v1/knowledgebase/") && strings.HasSuffix(path, "/wiki/stats")
+		if strings.HasPrefix(path, "/assets/") || isWikiStats {
+			c.Next()
+			return
+		}
+
 		// 读取请求体（在Next之前读取，因为Next会消费body）
 		var requestBody string
 		if c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "PATCH" {
@@ -178,12 +178,13 @@ func Logger() gin.HandlerFunc {
 		// 读取响应体
 		responseBodyStr := ""
 		if responseBody.Len() > 0 {
-			// 检查Content-Type，只记录JSON类型
 			contentType := c.Writer.Header().Get("Content-Type")
-			if strings.Contains(contentType, "application/json") ||
+			if strings.Contains(contentType, "text/event-stream") {
+				responseBodyStr = "[SSE流式响应，已跳过]"
+			} else if strings.Contains(contentType, "application/json") ||
 				strings.Contains(contentType, "text/") {
 				bodyBytes := responseBody.Bytes()
-				if len(bodyBytes) > maxBodySize {
+				if len(bodyBytes) >= maxBodySize {
 					responseBodyStr = string(bodyBytes[:maxBodySize]) + "... [内容过长，已截断]"
 				} else {
 					responseBodyStr = string(bodyBytes)

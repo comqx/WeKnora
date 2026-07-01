@@ -17,14 +17,15 @@ func init() {
 func (p *GenericProvider) Info() ProviderInfo {
 	return ProviderInfo{
 		Name:        ProviderGeneric,
-		DisplayName: "自定义 (OpenAI格式兼容接口)",
-		Description: "Generic API endpoint",
+		DisplayName: "自定义 (OpenAI兼容接口)",
+		Description: "Generic API endpoint (OpenAI-compatible)",
 		DefaultURLs: map[types.ModelType]string{}, // 需要用户自行配置填写
 		ModelTypes: []types.ModelType{
 			types.ModelTypeKnowledgeQA,
 			types.ModelTypeEmbedding,
 			types.ModelTypeRerank,
 			types.ModelTypeVLLM,
+			types.ModelTypeASR,
 		},
 		RequiresAuth: false, // 可能需要也可能不需要
 	}
