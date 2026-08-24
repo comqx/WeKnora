@@ -81,8 +81,8 @@ const { t } = useI18n()
 const authorizing = ref(false)
 const canceling = ref(false)
 const now = ref(Date.now())
-let clock: ReturnType<typeof setInterval> | null = null
-let poll: ReturnType<typeof setInterval> | null = null
+let clock: number | null = null
+let poll: number | null = null
 
 const deadline = computed(() => {
   const base = (props.requestedAt || 0) * 1000
@@ -138,7 +138,7 @@ function formatCountdown(s: number): string {
 
 function stopPoll() {
   if (poll) {
-    clearInterval(poll)
+    window.clearInterval(poll)
     poll = null
   }
 }
@@ -175,7 +175,7 @@ const authorize = async () => {
     const frontendRedirect = useEmbedOAuth()
       ? window.location.origin + window.location.pathname + window.location.search
       : window.location.origin + '/'
-    const authUrl = useEmbedOAuth()
+    const authorization = useEmbedOAuth()
       ? await getEmbedMCPOAuthAuthorizeURL(
         props.embedChannelId!,
         props.embedToken!,
@@ -189,12 +189,12 @@ const authorize = async () => {
         redirect_uri: redirectUri,
         frontend_redirect: frontendRedirect,
       })
-    if (!authUrl) {
+    if (!authorization.authorizationUrl || !authorization.authorizationAttempt) {
       MessagePlugin.error(t('agentStream.mcpOAuth.startFailed'))
       authorizing.value = false
       return
     }
-    const popup = window.open(authUrl, 'mcp_oauth', 'width=600,height=720')
+    const popup = window.open(authorization.authorizationUrl, 'mcp_oauth', 'width=600,height=720')
     poll = window.setInterval(async () => {
       const closed = !popup || popup.closed
       let ok = false
@@ -207,8 +207,9 @@ const authorize = async () => {
             props.embedSessionSig!,
             props.embedVisitorId!,
             props.serviceId,
+            authorization.authorizationAttempt,
           )
-          : await getMCPOAuthStatus(props.serviceId)
+          : await getMCPOAuthStatus(props.serviceId, authorization.authorizationAttempt)
       } catch {
         /* transient; keep polling */
       }
@@ -248,13 +249,13 @@ const authorize = async () => {
 }
 
 onMounted(() => {
-  clock = setInterval(() => {
+  clock = window.setInterval(() => {
     now.value = Date.now()
   }, 1000)
 })
 
 onBeforeUnmount(() => {
-  if (clock) clearInterval(clock)
+  if (clock) window.clearInterval(clock)
   stopPoll()
 })
 </script>
